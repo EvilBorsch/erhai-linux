@@ -1,0 +1,345 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/* Real regmap + SC8541 paths, with register storage in RAM (no I2C hardware). */
+#include <kunit/device.h>
+#include <kunit/test.h>
+
+struct sc8541_test {
+	struct sc8541 sc;
+	u8 regs[SC8541_MAX_REG + 1];
+	int fail_reg;
+	int fail_read_reg;
+	bool stuck_enabled;
+	u8 write_regs[64];
+	u8 write_values[64];
+	unsigned int writes;
+	unsigned int reads[SC8541_MAX_REG + 1];
+};
+
+static int sc8541_test_read(void *ctx, unsigned int reg, unsigned int *value)
+{
+	struct sc8541_test *f = ctx;
+
+	if (reg == f->fail_read_reg)
+		return -EREMOTEIO;
+	f->reads[reg]++;
+	*value = f->regs[reg];
+	if (f->stuck_enabled && reg == SC8541_CTRL2)
+		*value |= SC8541_CHG_EN;
+	return 0;
+}
+
+static int sc8541_test_write(void *ctx, unsigned int reg, unsigned int value)
+{
+	struct sc8541_test *f = ctx;
+
+	if (f->writes < ARRAY_SIZE(f->write_regs)) {
+		f->write_regs[f->writes] = reg;
+		f->write_values[f->writes++] = value;
+	}
+	if (reg == f->fail_reg)
+		return -EIO;
+	f->regs[reg] = value;
+	return 0;
+}
+
+static const struct regmap_bus sc8541_test_bus = {
+	.reg_read = sc8541_test_read,
+	.reg_write = sc8541_test_write,
+};
+
+static void sc8541_test_cleanup(void *data)
+{
+	struct sc8541_test *f = data;
+
+	cancel_delayed_work_sync(&f->sc.watch);
+	regmap_exit(f->sc.regmap);
+}
+
+static struct sc8541_test *sc8541_test_init(struct kunit *test)
+{
+	struct sc8541_test *f = kunit_kzalloc(test, sizeof(*f), GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	f->sc.dev = kunit_device_register(test, "sc8541-test");
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, f->sc.dev);
+	f->fail_reg = -1;
+	f->fail_read_reg = -1;
+	f->sc.busocp_ma = SC8541_BUSOCP_MA;
+	mutex_init(&f->sc.lock);
+	dev_set_drvdata(f->sc.dev, &f->sc);
+	INIT_DELAYED_WORK(&f->sc.watch, sc8541_watch);
+	f->sc.regmap = regmap_init(f->sc.dev, &sc8541_test_bus, f, &sc8541_regmap_config);
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, f->sc.regmap);
+	kunit_add_action_or_reset(test, sc8541_test_cleanup, f);
+	return f;
+}
+
+static void sc8541_test_protections(struct kunit *test)
+{
+	struct sc8541_test *f = sc8541_test_init(test);
+
+	f->regs[SC8541_BATOCP] = 0xd0;
+	f->regs[SC8541_TEMP_CTRL] = SC8541_TSHUT_DISABLE;
+	KUNIT_ASSERT_EQ(test, sc8541_enable(&f->sc), 0);
+	KUNIT_EXPECT_EQ(test, f->regs[SC8541_BATOCP], 80);
+	KUNIT_EXPECT_EQ(test, f->regs[SC8541_TEMP_CTRL] & SC8541_TSHUT_DISABLE, 0);
+	KUNIT_EXPECT_EQ(test, f->regs[SC8541_BATOVP], 0x60);
+	KUNIT_EXPECT_EQ(test, f->regs[SC8541_BATOVP_ALM], 0x4c);
+	KUNIT_EXPECT_EQ(test, f->regs[SC8541_BUSOVP], 80);
+	KUNIT_EXPECT_EQ(test, f->regs[SC8541_BUSOVP_ALM], 70);
+	KUNIT_EXPECT_EQ(test, f->regs[SC8541_BUSOCP] & 0x9f, 10);
+	KUNIT_EXPECT_EQ(test, f->regs[SC8541_CTRL2] & SC8541_EN_BYPASS, 0);
+	KUNIT_EXPECT_NE(test, f->regs[SC8541_CTRL2] & SC8541_CHG_EN, 0);
+	/* Expired software kick must stop switching through the real worker. */
+	cancel_delayed_work_sync(&f->sc.watch);
+	sc8541_watch(&f->sc.watch.work);
+	KUNIT_EXPECT_FALSE(test, f->sc.enabled);
+	KUNIT_EXPECT_EQ(test, f->regs[SC8541_CTRL2] & SC8541_CHG_EN, 0);
+}
+
+static void sc8541_test_hw_watchdog(struct kunit *test)
+{
+	struct sc8541_test *f = sc8541_test_init(test);
+	unsigned int writes;
+
+	f->regs[SC8541_CTRL3] = 0xa4;
+	KUNIT_ASSERT_EQ(test, sc8541_enable(&f->sc), 0);
+	KUNIT_EXPECT_EQ(test, f->regs[SC8541_CTRL3], 0xb0);
+	writes = f->writes;
+	KUNIT_ASSERT_EQ(test, sc8541_enable(&f->sc), 0);
+	KUNIT_ASSERT_EQ(test, f->writes, writes + 1);
+	KUNIT_EXPECT_EQ(test, f->write_regs[writes], SC8541_CTRL3);
+	f->fail_reg = SC8541_CTRL3;
+	KUNIT_EXPECT_EQ(test, sc8541_enable(&f->sc), -EIO);
+	KUNIT_EXPECT_EQ(test, f->regs[SC8541_CTRL2] & SC8541_CHG_EN, 0);
+	f->fail_reg = -1;
+	f->stuck_enabled = true;
+	KUNIT_EXPECT_EQ(test, sc8541_quiesce(&f->sc), -EBUSY);
+	KUNIT_EXPECT_EQ(test, f->regs[SC8541_CTRL3], 0xb0);
+	f->stuck_enabled = false;
+	KUNIT_ASSERT_EQ(test, sc8541_quiesce(&f->sc), 0);
+	KUNIT_EXPECT_EQ(test, f->regs[SC8541_CTRL3], 0xa4);
+}
+
+static void sc8541_test_failed_arm(struct kunit *test)
+{
+	struct sc8541_test *f = sc8541_test_init(test);
+
+	f->fail_reg = SC8541_BUSOVP;
+	KUNIT_EXPECT_EQ(test, sc8541_enable(&f->sc), -EIO);
+	KUNIT_EXPECT_FALSE(test, f->sc.enabled);
+	KUNIT_EXPECT_EQ(test, f->regs[SC8541_CTRL2] & SC8541_CHG_EN, 0);
+}
+
+static void sc8541_test_remove(struct kunit *test)
+{
+	struct sc8541_test *f = sc8541_test_init(test);
+
+	KUNIT_ASSERT_EQ(test, sc8541_enable(&f->sc), 0);
+	sc8541_stop(&f->sc);
+	KUNIT_EXPECT_EQ(test, f->regs[SC8541_CTRL2] & SC8541_CHG_EN, 0);
+	KUNIT_EXPECT_EQ(test, sc8541_enable(&f->sc), -ENODEV);
+	f->stuck_enabled = true;
+	KUNIT_EXPECT_EQ(test, sc8541_quiesce(&f->sc), -EBUSY);
+	KUNIT_EXPECT_TRUE(test, delayed_work_pending(&f->sc.watch));
+	sc8541_cancel_watch(&f->sc);
+	KUNIT_EXPECT_FALSE(test, delayed_work_pending(&f->sc.watch));
+}
+
+static void sc8541_test_adc(struct kunit *test)
+{
+	struct sc8541_test *f = sc8541_test_init(test);
+	int value;
+
+	f->regs[SC8541_ADC_BASE] = 1;
+	f->regs[SC8541_ADC_BASE + 1] = 0;
+	KUNIT_ASSERT_EQ(test, sc8541_read_adc(&f->sc, SC8541_ADC_IBUS, &value), 0);
+	KUNIT_EXPECT_EQ(test, value, 640000);
+	f->regs[SC8541_ADC_BASE + 2 * SC8541_ADC_TDIE + 1] = 100;
+	KUNIT_ASSERT_EQ(test, sc8541_read_adc(&f->sc, SC8541_ADC_TDIE, &value), 0);
+	KUNIT_EXPECT_EQ(test, value, 500);
+}
+
+static void sc8541_test_suspend_write_failure(struct kunit *test)
+{
+	struct sc8541_test *f = sc8541_test_init(test);
+
+	f->regs[SC8541_CTRL2] = SC8541_CHG_EN;
+	f->fail_reg = SC8541_CTRL2;
+	KUNIT_EXPECT_EQ(test, sc8541_suspend(f->sc.dev), -EIO);
+	KUNIT_EXPECT_TRUE(test, delayed_work_pending(&f->sc.watch));
+}
+
+static void sc8541_test_suspend_read_failure(struct kunit *test)
+{
+	struct sc8541_test *f = sc8541_test_init(test);
+
+	f->fail_read_reg = SC8541_CTRL2;
+	KUNIT_EXPECT_EQ(test, sc8541_suspend(f->sc.dev), -EREMOTEIO);
+	KUNIT_EXPECT_TRUE(test, delayed_work_pending(&f->sc.watch));
+}
+
+static void sc8541_test_suspend_still_enabled(struct kunit *test)
+{
+	struct sc8541_test *f = sc8541_test_init(test);
+
+	f->stuck_enabled = true;
+	KUNIT_EXPECT_EQ(test, sc8541_suspend(f->sc.dev), -EBUSY);
+	KUNIT_EXPECT_TRUE(test, delayed_work_pending(&f->sc.watch));
+}
+
+static void sc8541_test_suspend_stopped(struct kunit *test)
+{
+	struct sc8541_test *f = sc8541_test_init(test);
+
+	KUNIT_ASSERT_EQ(test, sc8541_enable(&f->sc), 0);
+	KUNIT_EXPECT_EQ(test, sc8541_suspend(f->sc.dev), 0);
+	KUNIT_EXPECT_FALSE(test, f->sc.enabled);
+	KUNIT_EXPECT_EQ(test, f->regs[SC8541_CTRL2] & SC8541_CHG_EN, 0);
+	KUNIT_EXPECT_FALSE(test, delayed_work_pending(&f->sc.watch));
+}
+
+static void sc8541_test_consumer_stop(struct kunit *test)
+{
+	struct sc8541_test *f = sc8541_test_init(test);
+	struct power_supply psy = { .drv_data = &f->sc };
+	union power_supply_propval val = { .intval = 0 };
+	int ret;
+
+	f->stuck_enabled = true;
+	ret = sc8541_set_property(&psy, POWER_SUPPLY_PROP_ONLINE, &val);
+	KUNIT_EXPECT_EQ(test, ret, -EBUSY);
+	KUNIT_EXPECT_TRUE(test, delayed_work_pending(&f->sc.watch));
+
+	f->stuck_enabled = false;
+	ret = sc8541_set_property(&psy, POWER_SUPPLY_PROP_ONLINE, &val);
+	KUNIT_EXPECT_EQ(test, ret, 0);
+	KUNIT_EXPECT_EQ(test, f->regs[SC8541_CTRL2] & SC8541_CHG_EN, 0);
+	KUNIT_EXPECT_FALSE(test, delayed_work_pending(&f->sc.watch));
+}
+
+/* Literal stock ops_cp_set_revchg register sequence, not driver tables. */
+static void sc8541_test_otg_sequence(struct kunit *test)
+{
+	static const u8 off_regs[] = {
+		0x0f, 0x00, 0x12, 0x02, 0x08, 0x05, 0x01,
+		0x00, 0x01, 0x02, 0x08, 0x06, 0x0e, 0x0f,
+	};
+	static const u8 off_values[] = {
+		0, 0, 0x80, 0x80, 0, 0, 0, 0x60, 0x4c, 0xd0, 0x18, 0x78, 0x60, 0,
+	};
+	struct sc8541_test *f = sc8541_test_init(test);
+
+	KUNIT_ASSERT_EQ(test, sc8541_otg_locked(&f->sc, SC8541_OTG_REVERSE_ON), 0);
+	KUNIT_ASSERT_EQ(test, f->writes, 2);
+	KUNIT_EXPECT_EQ(test, f->write_regs[0], 0x40);
+	KUNIT_EXPECT_EQ(test, f->write_values[0], 0x40);
+	KUNIT_EXPECT_EQ(test, f->write_regs[1], 0x40);
+	KUNIT_EXPECT_EQ(test, f->write_values[1], 0x60);
+	KUNIT_EXPECT_EQ(test, sc8541_enable(&f->sc), -EBUSY);
+	f->writes = 0;
+	KUNIT_ASSERT_EQ(test, sc8541_otg_locked(&f->sc, SC8541_OTG_REVERSE_OFF), 0);
+	KUNIT_ASSERT_EQ(test, f->writes, ARRAY_SIZE(off_regs));
+	KUNIT_EXPECT_MEMEQ(test, f->write_regs, off_regs, sizeof(off_regs));
+	KUNIT_EXPECT_MEMEQ(test, f->write_values, off_values, sizeof(off_values));
+	KUNIT_EXPECT_EQ(test, f->regs[0x40], 0x60);
+	KUNIT_EXPECT_FALSE(test, f->sc.otg_owned);
+}
+
+static void sc8541_test_otg_detach(struct kunit *test)
+{
+	static const u8 regs[] = { 5, 5, 0x41, 0x41 };
+	static const u8 values[] = { 0x24, 0x20, 0x12, 0x02 };
+	struct sc8541_test *f = sc8541_test_init(test);
+
+	f->regs[5] = 0xa4;
+	f->regs[0x41] = 0x92;
+	KUNIT_ASSERT_EQ(test, sc8541_otg_locked(&f->sc, SC8541_OTG_DETACH), 0);
+	KUNIT_ASSERT_EQ(test, f->writes, 4);
+	KUNIT_EXPECT_MEMEQ(test, f->write_regs, regs, sizeof(regs));
+	KUNIT_EXPECT_MEMEQ(test, f->write_values, values, sizeof(values));
+}
+
+static void sc8541_test_otg_failure(struct kunit *test)
+{
+	struct sc8541_test *f = sc8541_test_init(test);
+
+	f->fail_reg = 0x40;
+	KUNIT_EXPECT_EQ(test, sc8541_otg_locked(&f->sc, SC8541_OTG_REVERSE_ON), -EIO);
+	KUNIT_EXPECT_EQ(test, f->writes, 1);
+	KUNIT_EXPECT_TRUE(test, f->sc.otg_owned);
+	KUNIT_EXPECT_EQ(test, sc8541_enable(&f->sc), -EBUSY);
+	f->fail_reg = -1;
+	f->fail_read_reg = 0x40;
+	KUNIT_EXPECT_EQ(test, sc8541_otg_locked(&f->sc, SC8541_OTG_REVERSE_OFF), -EREMOTEIO);
+	KUNIT_EXPECT_TRUE(test, f->sc.otg_owned);
+	f->fail_read_reg = -1;
+	KUNIT_EXPECT_EQ(test, sc8541_otg_locked(&f->sc, SC8541_OTG_REVERSE_OFF), 0);
+	KUNIT_EXPECT_FALSE(test, f->sc.otg_owned);
+}
+
+static void sc8541_test_pen_gate(struct kunit *test)
+{
+	struct sc8541_test *f = sc8541_test_init(test);
+
+	f->regs[0x40] = 0x25;
+	KUNIT_ASSERT_EQ(test, sc8541_otg_locked(&f->sc, SC8541_PEN_ISOLATE), 0);
+	KUNIT_EXPECT_EQ(test, f->regs[0x40], 0x45);
+	KUNIT_EXPECT_TRUE(test, f->sc.pen_owned);
+	KUNIT_EXPECT_EQ(test, sc8541_enable(&f->sc), -EBUSY);
+	KUNIT_EXPECT_EQ(test, sc8541_otg_locked(&f->sc, SC8541_OTG_REVERSE_ON), -EBUSY);
+	/* Re-applying after an ADSP epoch must not overwrite the saved gate. */
+	KUNIT_ASSERT_EQ(test, sc8541_otg_locked(&f->sc, SC8541_PEN_ISOLATE), 0);
+	KUNIT_ASSERT_EQ(test, sc8541_otg_locked(&f->sc, SC8541_PEN_RESTORE), 0);
+	KUNIT_EXPECT_EQ(test, f->regs[0x40], 0x25);
+	KUNIT_EXPECT_FALSE(test, f->sc.pen_owned);
+	f->sc.enabled = true;
+	KUNIT_EXPECT_EQ(test, sc8541_otg_locked(&f->sc, SC8541_PEN_ISOLATE), -EBUSY);
+	KUNIT_EXPECT_EQ(test, f->regs[0x40], 0x25);
+}
+
+static void sc8541_test_off_snapshot(struct kunit *test)
+{
+	struct sc8541_test *f = sc8541_test_init(test);
+	int online, n;
+
+	KUNIT_ASSERT_EQ(test, sc8541_enable(&f->sc), 0);
+	KUNIT_ASSERT_EQ(test, sc8541_online(&f->sc, &online), 0);
+	KUNIT_EXPECT_EQ(test, online, 1);
+	f->regs[SC8541_CTRL2] &= ~SC8541_CHG_EN;
+	for (n = 0x13; n <= 0x1c; n++)
+		f->regs[n] = n;
+	KUNIT_ASSERT_EQ(test, sc8541_online(&f->sc, &online), 0);
+	KUNIT_EXPECT_EQ(test, online, 0);
+	for (n = 0x13; n <= 0x1c; n++)
+		KUNIT_EXPECT_EQ(test, f->reads[n], 1);
+	KUNIT_ASSERT_EQ(test, sc8541_online(&f->sc, &online), 0);
+	for (n = 0x13; n <= 0x1c; n++)
+		KUNIT_EXPECT_EQ(test, f->reads[n], 1);
+	KUNIT_EXPECT_TRUE(test, f->sc.enabled);
+}
+
+static struct kunit_case sc8541_test_cases[] = {
+	KUNIT_CASE(sc8541_test_pen_gate),
+	KUNIT_CASE(sc8541_test_otg_failure),
+	KUNIT_CASE(sc8541_test_otg_detach),
+	KUNIT_CASE(sc8541_test_otg_sequence),
+	KUNIT_CASE(sc8541_test_protections),
+	KUNIT_CASE(sc8541_test_off_snapshot),
+	KUNIT_CASE(sc8541_test_failed_arm),
+	KUNIT_CASE(sc8541_test_hw_watchdog),
+	KUNIT_CASE(sc8541_test_remove),
+	KUNIT_CASE(sc8541_test_adc),
+	KUNIT_CASE(sc8541_test_suspend_write_failure),
+	KUNIT_CASE(sc8541_test_suspend_read_failure),
+	KUNIT_CASE(sc8541_test_suspend_still_enabled),
+	KUNIT_CASE(sc8541_test_suspend_stopped),
+	KUNIT_CASE(sc8541_test_consumer_stop),
+	{}
+};
+
+static struct kunit_suite sc8541_test_suite = {
+	.name = "sc8541-charger",
+	.test_cases = sc8541_test_cases,
+};
+kunit_test_suite(sc8541_test_suite);

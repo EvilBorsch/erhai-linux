@@ -1,0 +1,869 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * Southchip SC8541 single-cell switched-capacitor (2:1) direct charger
+ *
+ * The register layout follows the TI bq25960 (see bq25980_charger.h) with
+ * different ADC scales and threshold offsets.  This driver does not run a
+ * charging algorithm: the switched-capacitor stage only works when the
+ * source is held at about twice the battery voltage (a USB PD PPS source),
+ * which is the job of the PD sink driver.  It exposes the stage as a power
+ * supply:
+ *
+ *   online	read: switching enabled.  Writing 1 programs the protections
+ *		below, starts the ADC, enables switching and must be repeated
+ *		at least every SC8541_KICK_MS or switching is turned off again;
+ *		writing 0 turns it off.  The chip takes a moment to report
+ *		CHG_EN after it is written, so a caller checks it at its next
+ *		poll, as stock does.
+ *   input_current_limit	bus over-current protection, SC8541_BUSOCP_MIN_MA
+ *		to SC8541_BUSOCP_MAX_MA (default SC8541_BUSOCP_MA), applied
+ *		at once
+ *   voltage_now, current_now	bus voltage and current
+ *   temp	die temperature
+ *
+ * The forward charger and the firmware-requested OTG path have separate
+ * register sequences. On Piano, MCA can request the stock reverse gate
+ * configuration; it does not enable forward switching or the PMIC boost.
+ */
+
+#include <linux/debugfs.h>
+#include <linux/delay.h>
+#include <linux/i2c.h>
+#include <linux/module.h>
+#include <linux/mutex.h>
+#include <linux/of.h>
+#include <linux/power_supply.h>
+#include <linux/power/sc8541_charger.h>
+#include <linux/regmap.h>
+#include <linux/seq_file.h>
+#include <linux/workqueue.h>
+
+#define SC8541_BATOVP		0x00	/* bit7 disable, 3840 + 10 mV * [6:0] */
+#define SC8541_BATOVP_ALM	0x01
+#define SC8541_BUSOVP		0x06	/* 7000 + 50 mV * [7:0] */
+#define SC8541_BUSOVP_ALM	0x07
+#define SC8541_BUSOCP		0x08	/* bit7 disable, 1000 + 250 mA * [4:0] */
+#define SC8541_TEMP_CTRL	0x0a
+#define SC8541_TSHUT_DISABLE	BIT(7)
+#define SC8541_CTRL2		0x0f
+#define SC8541_CHG_EN		BIT(4)
+#define SC8541_CTRL3		0x10
+#define SC8541_WD_MASK		GENMASK(4, 2)
+#define SC8541_WD_ACTIVE	BIT(4)	/* WD_TIMEOUT=2, WD_TIMEOUT_DIS=0 */
+#define SC8541_EN_BYPASS	BIT(3)
+#define SC8541_DEVICE_INFO	0x22
+#define SC8541_DEVICE_ID	0x41
+#define SC8541_ADC_CTRL1	0x23
+#define SC8541_ADC_EN		BIT(7)
+#define SC8541_ADC_CTRL2	0x24	/* per-channel disable bits */
+#define SC8541_ADC_BASE		0x25	/* channel n: MSB at base + 2n */
+/* Stock sc8541 ops_cp_set_revchg / ops_cp_set_manual_revchg_mode. */
+#define SC8541_BATOCP		0x02
+#define SC8541_REVERSE_CTRL	0x05
+#define SC8541_USBOVP		0x0e
+#define SC8541_PROTECTION_CTRL	0x12
+#define SC8541_GATE_CTRL	0x40
+#define SC8541_ACDRV_MANUAL		BIT(6)
+#define SC8541_OVPGATE		BIT(5)
+#define SC8541_MANUAL_REVERSE	0x41
+#define SC8541_MAX_REG		SC8541_MANUAL_REVERSE
+
+#define SC8541_BATOVP_OFFSET_MV	3840
+#define SC8541_BATOVP_STEP_MV	10
+#define SC8541_BUSOVP_OFFSET_MV	7000
+#define SC8541_BUSOVP_STEP_MV	50
+#define SC8541_BUSOCP_OFFSET_MA	1000
+#define SC8541_BUSOCP_STEP_MA	250
+
+/*
+ * Piano stock DT bat-ovp-threshold / bat-ovp-alarm-threshold.
+ * These protect the pump's local battery node. MCA regulates the two
+ * gauge voltages to their temperature-dependent cell envelope.
+ */
+#define SC8541_BATOVP_MV	4800
+#define SC8541_BATOVP_ALM_MV	4600
+#define SC8541_BUSOVP_MV	11000
+#define SC8541_BUSOVP_ALM_MV	10500
+#define SC8541_BUSOCP_MA	3500
+#define SC8541_BUSOCP_MIN_MA	1000
+#define SC8541_BUSOCP_MAX_MA	7000	/* stock bus-ocp-threshold */
+
+/* Switching is turned off unless "online" is written again within this */
+#define SC8541_KICK_MS		3000
+/*
+ * CHG_EN reads back as set only some time after it is written, and is
+ * written as a whole whatever it reads, so stopping must not depend on
+ * reading it: after every stop the watch checks again this much later and
+ * stops it again (as long as it takes) if it is still set.
+ */
+#define SC8541_GUARD_MS		500
+
+enum sc8541_adc {
+	SC8541_ADC_IBUS,
+	SC8541_ADC_VBUS,
+	SC8541_ADC_VAC1,
+	SC8541_ADC_VAC2,
+	SC8541_ADC_VOUT,
+	SC8541_ADC_VBAT,
+	SC8541_ADC_IBAT,
+	SC8541_ADC_TSBUS,
+	SC8541_ADC_TSBAT,
+	SC8541_ADC_TDIE,
+	SC8541_ADC_NUM,
+};
+
+/* LSB of each channel in uV, uA or 0.1 degC (from the stock driver) */
+static const struct {
+	const char *name;
+	u32 num, den;
+} sc8541_adc_scale[] = {
+	[SC8541_ADC_IBUS]	= { "ibus_ua",	2500, 1 },
+	[SC8541_ADC_VBUS]	= { "vbus_uv",	3750, 1 },
+	[SC8541_ADC_VAC1]	= { "vac1_uv",	5000, 1 },
+	[SC8541_ADC_VAC2]	= { "vac2_uv",	5000, 1 },
+	[SC8541_ADC_VOUT]	= { "vout_uv",	1250, 1 },
+	[SC8541_ADC_VBAT]	= { "vbat_uv",	1250, 1 },
+	[SC8541_ADC_IBAT]	= { "ibat_ua",	3125, 1 },
+	[SC8541_ADC_TSBUS]	= { "tsbus_raw", 1, 1 },
+	[SC8541_ADC_TSBAT]	= { "tsbat_raw", 1, 1 },
+	[SC8541_ADC_TDIE]	= { "tdie_ddegc", 5, 1 },
+};
+
+struct sc8541 {
+	struct device *dev;
+	struct regmap *regmap;
+	struct power_supply *psy;
+	struct mutex lock;		/* enabled, register sequences */
+	struct delayed_work watch;	/* kick timeout, or the check after a stop */
+	bool enabled;
+	bool seen_switching;
+	bool removing;
+	bool wd_owned;
+	unsigned int wd_saved;
+	bool pen_owned;
+	u32 pen_gate_saved;
+	bool otg_owned;		/* excludes the forward charging policy */
+	u32 busocp_ma;
+	struct dentry *dbg;
+};
+
+static int sc8541_read_adc(struct sc8541 *sc, enum sc8541_adc ch, int *val)
+{
+	u8 buf[2];
+	int ret;
+
+	ret = regmap_bulk_read(sc->regmap, SC8541_ADC_BASE + 2 * ch, buf, 2);
+	if (ret)
+		return ret;
+
+	*val = (buf[0] << 8 | buf[1]) * sc8541_adc_scale[ch].num /
+	       sc8541_adc_scale[ch].den;
+	return 0;
+}
+
+static int sc8541_adc_enabled(struct sc8541 *sc)
+{
+	unsigned int val;
+	int ret;
+
+	ret = regmap_read(sc->regmap, SC8541_ADC_CTRL1, &val);
+	if (ret)
+		return ret;
+
+	return !!(val & SC8541_ADC_EN);
+}
+
+/* Write @val to @reg under @mask and check that it reads back */
+static int sc8541_write_check(struct sc8541 *sc, unsigned int reg,
+			      unsigned int mask, unsigned int val)
+{
+	unsigned int rd;
+	int ret;
+
+	ret = regmap_write_bits(sc->regmap, reg, mask, val);
+	if (ret)
+		return ret;
+	ret = regmap_read(sc->regmap, reg, &rd);
+	if (ret)
+		return ret;
+	if ((rd & mask) != val) {
+		dev_err(sc->dev, "reg 0x%02x reads 0x%02x, wrote 0x%02x/0x%02x\n",
+			reg, rd, val, mask);
+		return -EIO;
+	}
+
+	return 0;
+}
+
+/* Clear CHG_EN with a write whatever it reads back as */
+static int sc8541_stop_switching(struct sc8541 *sc)
+{
+	int ret;
+
+	ret = regmap_write_bits(sc->regmap, SC8541_CTRL2, SC8541_CHG_EN, 0);
+	if (ret)
+		dev_err(sc->dev, "failed to stop switching: %d\n", ret);
+
+	return ret;
+}
+
+static void sc8541_disable_locked(struct sc8541 *sc)
+{
+	sc8541_stop_switching(sc);
+	if (sc->enabled)
+		dev_info(sc->dev, "switching off\n");
+	sc->enabled = false;
+	sc->seen_switching = false;
+	mod_delayed_work(system_dfl_wq, &sc->watch,
+			 msecs_to_jiffies(SC8541_GUARD_MS));
+}
+
+/* Protections and the ADC, written before every start */
+static int sc8541_arm(struct sc8541 *sc)
+{
+	int ret;
+
+	ret = sc8541_write_check(sc, SC8541_BATOVP, 0xff,
+				 (SC8541_BATOVP_MV - SC8541_BATOVP_OFFSET_MV) /
+				 SC8541_BATOVP_STEP_MV);
+	ret = ret ?: sc8541_write_check(sc, SC8541_BATOVP_ALM, 0xff,
+				(SC8541_BATOVP_ALM_MV - SC8541_BATOVP_OFFSET_MV) /
+				SC8541_BATOVP_STEP_MV);
+	ret = ret ?: sc8541_write_check(sc, SC8541_BUSOVP, 0xff,
+				(SC8541_BUSOVP_MV - SC8541_BUSOVP_OFFSET_MV) /
+				SC8541_BUSOVP_STEP_MV);
+	ret = ret ?: sc8541_write_check(sc, SC8541_BUSOVP_ALM, 0xff,
+				(SC8541_BUSOVP_ALM_MV - SC8541_BUSOVP_OFFSET_MV) /
+				SC8541_BUSOVP_STEP_MV);
+	ret = ret ?: sc8541_write_check(sc, SC8541_BUSOCP, 0x9f,
+				(sc->busocp_ma - SC8541_BUSOCP_OFFSET_MA) /
+				SC8541_BUSOCP_STEP_MA);
+	/* Reverse mode may leave IBAT_OCP disabled. SC8541 is rated
+	 * for 8 A output. Southchip's SC8541_IBAT_OCP converter for REG02
+	 * starts at zero in 100 mA steps; REG11 selects the sense resistor.
+	 * Preserve the board setting. The gauges independently limit pack current.
+	 */
+	ret = ret ?: sc8541_write_check(sc, SC8541_BATOCP, 0xff, 8000 / 100);
+	ret = ret ?: sc8541_write_check(sc, SC8541_TEMP_CTRL, SC8541_TSHUT_DISABLE, 0);
+	/* 2:1, not bypass */
+	ret = ret ?: sc8541_write_check(sc, SC8541_CTRL2, SC8541_EN_BYPASS, 0);
+	/* all channels, continuous conversion */
+	ret = ret ?: sc8541_write_check(sc, SC8541_ADC_CTRL2, 0xff, 0);
+	ret = ret ?: sc8541_write_check(sc, SC8541_ADC_CTRL1, 0xc3,
+					SC8541_ADC_EN);
+
+	return ret;
+}
+
+/* Restore the preceding mode's watchdog setting only after CHG_EN is clear. */
+static int sc8541_release_watchdog(struct sc8541 *sc)
+{
+	int ret;
+
+	if (!sc->wd_owned)
+		return 0;
+	ret = sc8541_write_check(sc, SC8541_CTRL3, SC8541_WD_MASK, sc->wd_saved);
+	if (!ret)
+		sc->wd_owned = false;
+	return ret;
+}
+
+static int sc8541_feed_watchdog(struct sc8541 *sc)
+{
+	unsigned int ctrl;
+	int ret;
+
+	if (!sc->wd_owned) {
+		ret = regmap_read(sc->regmap, SC8541_CTRL3, &ctrl);
+		if (ret)
+			return ret;
+		sc->wd_saved = ctrl & SC8541_WD_MASK;
+		sc->wd_owned = true;
+	}
+	/* Force a bus write on every MCA heartbeat, even for an unchanged value. */
+	return sc8541_write_check(sc, SC8541_CTRL3, SC8541_WD_MASK, SC8541_WD_ACTIVE);
+}
+
+static int sc8541_enable(struct sc8541 *sc)
+{
+	int ret = 0;
+
+	mutex_lock(&sc->lock);
+	if (sc->removing) {
+		ret = -ENODEV;
+		goto out;
+	}
+	if (sc->otg_owned || sc->pen_owned) {
+		ret = -EBUSY;
+		goto out;
+	}
+	ret = sc8541_feed_watchdog(sc);
+	if (ret) {
+		sc8541_disable_locked(sc);
+		goto out;
+	}
+	if (!sc->enabled) {
+		ret = sc8541_arm(sc);
+		ret = ret ?: regmap_write_bits(sc->regmap, SC8541_CTRL2,
+					       SC8541_CHG_EN, SC8541_CHG_EN);
+		if (ret) {
+			sc8541_disable_locked(sc);
+			goto out;
+		}
+		dev_info(sc->dev, "switching on\n");
+		sc->enabled = true;
+	}
+	mod_delayed_work(system_dfl_wq, &sc->watch, msecs_to_jiffies(SC8541_KICK_MS));
+out:
+	mutex_unlock(&sc->lock);
+
+	return ret;
+}
+
+static void sc8541_disable(struct sc8541 *sc)
+{
+	mutex_lock(&sc->lock);
+	sc8541_disable_locked(sc);
+	mutex_unlock(&sc->lock);
+}
+
+/*
+ * Final stop (unbind, shutdown, suspend): no watch afterwards, so stop,
+ * wait out the CHG_EN latency and stop again.
+ */
+static int sc8541_disable_sync(struct sc8541 *sc)
+{
+	unsigned int ctrl;
+	int ret;
+
+	sc8541_disable(sc);
+	cancel_delayed_work_sync(&sc->watch);
+	msleep(SC8541_GUARD_MS);
+	mutex_lock(&sc->lock);
+	ret = sc8541_stop_switching(sc);
+	ret = ret ?: regmap_read(sc->regmap, SC8541_CTRL2, &ctrl);
+	if (!ret && (ctrl & SC8541_CHG_EN)) {
+		dev_err(sc->dev, "still switching after stop\n");
+		ret = -EBUSY;
+	}
+	ret = ret ?: sc8541_release_watchdog(sc);
+	mutex_unlock(&sc->lock);
+	return ret;
+}
+
+/* A live consumer may proceed only after the stage is confirmed off. */
+static int sc8541_quiesce(struct sc8541 *sc)
+{
+	int ret = sc8541_disable_sync(sc);
+
+	if (ret)
+		mod_delayed_work(system_dfl_wq, &sc->watch,
+				 msecs_to_jiffies(SC8541_GUARD_MS));
+	return ret;
+}
+
+static void sc8541_watch(struct work_struct *work)
+{
+	struct sc8541 *sc = container_of(work, struct sc8541, watch.work);
+	unsigned int ctrl;
+
+	mutex_lock(&sc->lock);
+	if (sc->enabled) {
+		dev_warn(sc->dev, "not kicked for %d ms\n", SC8541_KICK_MS);
+		sc8541_disable_locked(sc);
+	} else if (regmap_read(sc->regmap, SC8541_CTRL2, &ctrl) ||
+		   (ctrl & SC8541_CHG_EN)) {
+		dev_warn(sc->dev, "still switching after stop, stopping again\n");
+		sc8541_disable_locked(sc);
+	} else if (sc8541_release_watchdog(sc)) {
+		mod_delayed_work(system_dfl_wq, &sc->watch, msecs_to_jiffies(SC8541_GUARD_MS));
+	}
+	mutex_unlock(&sc->lock);
+}
+
+/*
+ * Piano stock sc8541.ko, ops_cp_set_revchg(false) ->
+ * sc8541_set_operation_mode(1), .text 0x1c54..0x1ee8. Values are from
+ * this board's stock DT (4800/4600 mV battery, 7 A bus, 13/14 V OVP).
+ * CHG_EN is cleared before restoring them. The forward charger still
+ * programs its own lower protections in sc8541_arm().
+ */
+static int sc8541_otg_restore_mode(struct sc8541 *sc)
+{
+	static const struct {
+		u8 reg, mask, value;
+	} sequence[] = {
+		{ SC8541_BATOVP, 0x80, 0 },
+		{ SC8541_PROTECTION_CTRL, 0x80, 0x80 },
+		{ SC8541_BATOCP, 0x80, 0x80 },
+		{ SC8541_BUSOCP, 0x80, 0 },
+		{ SC8541_REVERSE_CTRL, 0x80, 0 },
+		{ SC8541_BATOVP_ALM, 0x80, 0 },
+		{ SC8541_BATOVP, 0x7f, 0x60 },
+		{ SC8541_BATOVP_ALM, 0x7f, 0x4c },
+		{ SC8541_BATOCP, 0x7f, 0x50 },
+		{ SC8541_BUSOCP, 0x1f, 0x18 },
+		{ SC8541_BUSOVP, 0xff, 0x78 },
+		{ SC8541_USBOVP, 0xe0, 0x60 },
+		{ SC8541_CTRL2, SC8541_EN_BYPASS, 0 },
+	};
+	int i, ret;
+
+	for (i = 0; i < ARRAY_SIZE(sequence); i++) {
+		ret = regmap_write_bits(sc->regmap, sequence[i].reg,
+					sequence[i].mask, sequence[i].value);
+		if (ret)
+			return ret;
+	}
+	return 0;
+}
+
+/* Called with the register sequence lock held, with no forward owner. */
+static int sc8541_otg_locked(struct sc8541 *sc, enum sc8541_otg_action action)
+{
+	unsigned int value;
+	int ret;
+
+	if (action == SC8541_OTG_PRESENT)
+		return 0;
+	if (sc->removing)
+		return -ENODEV;
+	if (sc->enabled || sc->wd_owned)
+		return -EBUSY;
+	/* Piano quickchg stop: mode reset precedes buck votes, ADC off follows
+	 * them. Forward/reverse ownership is mutually exclusive throughout.
+	 */
+	if (action == SC8541_CHARGE_MODE_RESET || action == SC8541_CHARGE_ADC_OFF) {
+		if (sc->otg_owned || sc->pen_owned)
+			return -EBUSY;
+		if (action == SC8541_CHARGE_MODE_RESET)
+			return sc8541_otg_restore_mode(sc);
+		return sc8541_write_check(sc, SC8541_ADC_CTRL1, SC8541_ADC_EN, 0);
+	}
+	if (action == SC8541_PEN_ISOLATE) {
+		if (sc->otg_owned)
+			return -EBUSY;
+		if (!sc->pen_owned) {
+			ret = regmap_read(sc->regmap, SC8541_GATE_CTRL, &value);
+			if (ret)
+				return ret;
+			sc->pen_gate_saved = value;
+			sc->pen_owned = true;
+		}
+		/* Stock client 1 votes the OVP gate OFF before HBOOST. */
+		return sc8541_write_check(sc, SC8541_GATE_CTRL,
+				SC8541_ACDRV_MANUAL | SC8541_OVPGATE,
+				SC8541_ACDRV_MANUAL);
+	}
+	if (action == SC8541_PEN_RESTORE) {
+		if (!sc->pen_owned)
+			return 0;
+		ret = sc8541_write_check(sc, SC8541_GATE_CTRL,
+				SC8541_ACDRV_MANUAL | SC8541_OVPGATE,
+				sc->pen_gate_saved & (SC8541_ACDRV_MANUAL | SC8541_OVPGATE));
+		if (!ret)
+			sc->pen_owned = false;
+		return ret;
+	}
+	if (sc->pen_owned)
+		return -EBUSY;
+
+	/* Retain ownership after a partial write; do not start sink charging. */
+	if (action == SC8541_OTG_REVERSE_ON || action == SC8541_OTG_REVERSE_OFF)
+		sc->otg_owned = true;
+	switch (action) {
+	case SC8541_OTG_REVERSE_ON:
+		/* ops_cp_set_revchg(true), 0x2a40..0x2a68. */
+		ret = regmap_write_bits(sc->regmap, SC8541_GATE_CTRL,
+					SC8541_ACDRV_MANUAL, SC8541_ACDRV_MANUAL);
+		ret = ret ?: sc8541_write_check(sc, SC8541_GATE_CTRL,
+						SC8541_OVPGATE, SC8541_OVPGATE);
+		ret = ret ?: regmap_read(sc->regmap, SC8541_GATE_CTRL, &value);
+		if (!ret && !(value & SC8541_OVPGATE))
+			ret = -EIO;
+		break;
+	case SC8541_OTG_REVERSE_OFF:
+		/* 0x2ae4..0x2b90: do not clear the gate or REVCHG bits. */
+		ret = sc8541_stop_switching(sc);
+		ret = ret ?: sc8541_otg_restore_mode(sc);
+		ret = ret ?: regmap_read(sc->regmap, SC8541_GATE_CTRL, &value);
+		ret = ret ?: regmap_read(sc->regmap, SC8541_CTRL2, &value);
+		if (!ret && (value & SC8541_EN_BYPASS))
+			ret = -EIO;
+		if (!ret)
+			ret = regmap_read(sc->regmap, SC8541_CTRL2, &value);
+		if (!ret && (value & SC8541_CHG_EN))
+			ret = -EBUSY;
+		break;
+	case SC8541_OTG_DETACH:
+		/* ops_cp_set_manual_revchg_mode(false), 0x2c54..0x2cb0. */
+		ret = regmap_write_bits(sc->regmap, SC8541_REVERSE_CTRL, 0x80, 0);
+		ret = ret ?: regmap_write_bits(sc->regmap, SC8541_REVERSE_CTRL, 0x04, 0);
+		ret = ret ?: regmap_write_bits(sc->regmap, SC8541_MANUAL_REVERSE, 0x80, 0);
+		ret = ret ?: regmap_write_bits(sc->regmap, SC8541_MANUAL_REVERSE, 0x10, 0);
+		break;
+	default:
+		return -EINVAL;
+	}
+	if (!ret && action == SC8541_OTG_REVERSE_OFF)
+		sc->otg_owned = false;
+	dev_info(sc->dev, "OTG action %u result %d\n", action, ret);
+	return ret;
+}
+
+static struct i2c_driver sc8541_driver;
+
+/*
+ * A power_supply reference keeps its parent device alive, not its driver.
+ * Serialize against bind/unbind before dereferencing the parent's data.
+ */
+int sc8541_otg_configure(struct power_supply *psy, enum sc8541_otg_action action)
+{
+	struct device *dev = psy->dev.parent;
+	struct sc8541 *sc;
+	int ret = -ENODEV;
+
+	if (!dev)
+		return -ENODEV;
+	device_lock(dev);
+	if (dev->driver != &sc8541_driver.driver)
+		goto out;
+	sc = dev_get_drvdata(dev);
+	if (!sc || sc->psy != psy)
+		goto out;
+	/* The recovered protection table belongs to Piano only. */
+	if (!of_machine_is_compatible("xiaomi,piano")) {
+		ret = -EOPNOTSUPP;
+		goto out;
+	}
+	mutex_lock(&sc->lock);
+	ret = sc8541_otg_locked(sc, action);
+	mutex_unlock(&sc->lock);
+out:
+	device_unlock(dev);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(sc8541_otg_configure);
+
+/* Keep the evidence from a running stage before the consumer disarms it.
+ * The stock interrupt handler samples status and flags at 0x13..0x1c.
+ * Read the latches once per falling edge, including on a userspace poll.
+ */
+static int sc8541_online(struct sc8541 *sc, int *online)
+{
+	unsigned int ctrl;
+	u8 fault[10];
+	int ret;
+
+	guard(mutex)(&sc->lock);
+	ret = regmap_read(sc->regmap, SC8541_CTRL2, &ctrl);
+	if (ret)
+		return ret;
+	*online = !!(ctrl & SC8541_CHG_EN);
+	if (sc->enabled && sc->seen_switching && !*online) {
+		ret = regmap_bulk_read(sc->regmap, 0x13, fault, sizeof(fault));
+		if (ret)
+			dev_warn(sc->dev, "stage off: status/flags read failed: %d\n", ret);
+		else
+			dev_warn(sc->dev, "stage off: status[13..17]=%5ph flags[18..1c]=%5ph\n",
+				 fault, fault + 5);
+	}
+	sc->seen_switching = sc->enabled && *online;
+	return 0;
+}
+
+static int sc8541_get_property(struct power_supply *psy,
+			       enum power_supply_property psp,
+			       union power_supply_propval *val)
+{
+	struct sc8541 *sc = power_supply_get_drvdata(psy);
+	int ret;
+
+	switch (psp) {
+	case POWER_SUPPLY_PROP_ONLINE:
+		return sc8541_online(sc, &val->intval);
+	case POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT:
+		val->intval = sc->busocp_ma * 1000;
+		return 0;
+	case POWER_SUPPLY_PROP_VOLTAGE_NOW:
+	case POWER_SUPPLY_PROP_CURRENT_NOW:
+	case POWER_SUPPLY_PROP_TEMP:
+		ret = sc8541_adc_enabled(sc);
+		if (ret <= 0)
+			return ret ?: -ENODATA;
+		return sc8541_read_adc(sc,
+				psp == POWER_SUPPLY_PROP_VOLTAGE_NOW ? SC8541_ADC_VBUS :
+				psp == POWER_SUPPLY_PROP_CURRENT_NOW ? SC8541_ADC_IBUS :
+				SC8541_ADC_TDIE, &val->intval);
+	default:
+		return -EINVAL;
+	}
+}
+
+static int sc8541_set_property(struct power_supply *psy,
+			       enum power_supply_property psp,
+			       const union power_supply_propval *val)
+{
+	struct sc8541 *sc = power_supply_get_drvdata(psy);
+	int ret;
+
+	if (psp == POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT) {
+		mutex_lock(&sc->lock);
+		if (sc->otg_owned || sc->pen_owned) {
+			mutex_unlock(&sc->lock);
+			return -EBUSY;
+		}
+		sc->busocp_ma = clamp(val->intval / 1000, SC8541_BUSOCP_MIN_MA,
+				      SC8541_BUSOCP_MAX_MA);
+		ret = sc8541_write_check(sc, SC8541_BUSOCP, 0x9f,
+				(sc->busocp_ma - SC8541_BUSOCP_OFFSET_MA) /
+				SC8541_BUSOCP_STEP_MA);
+		mutex_unlock(&sc->lock);
+		return ret;
+	}
+	if (psp != POWER_SUPPLY_PROP_ONLINE)
+		return -EINVAL;
+
+	if (val->intval)
+		return sc8541_enable(sc);
+
+	return sc8541_quiesce(sc);
+}
+
+static int sc8541_property_is_writeable(struct power_supply *psy,
+					enum power_supply_property psp)
+{
+	return psp == POWER_SUPPLY_PROP_ONLINE ||
+	       psp == POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT;
+}
+
+static const enum power_supply_property sc8541_props[] = {
+	POWER_SUPPLY_PROP_ONLINE,
+	POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT,
+	POWER_SUPPLY_PROP_VOLTAGE_NOW,
+	POWER_SUPPLY_PROP_CURRENT_NOW,
+	POWER_SUPPLY_PROP_TEMP,
+};
+
+/*
+ * Not a source of its own: an unknown type keeps it out of the line power
+ * and battery lists of userspace.
+ */
+static const struct power_supply_desc sc8541_desc = {
+	.name = "sc8541",
+	.type = POWER_SUPPLY_TYPE_UNKNOWN,
+	.properties = sc8541_props,
+	.num_properties = ARRAY_SIZE(sc8541_props),
+	.get_property = sc8541_get_property,
+	.set_property = sc8541_set_property,
+	.property_is_writeable = sc8541_property_is_writeable,
+	.no_thermal = true,
+};
+
+/*
+ * debugfs: "regs" dumps every register, "adc" every channel (write 1 to
+ * start the ADC without switching)
+ */
+static int sc8541_dbg_regs_show(struct seq_file *s, void *unused)
+{
+	struct sc8541 *sc = s->private;
+	unsigned int reg, val;
+
+	for (reg = 0; reg <= SC8541_MAX_REG; reg++) {
+		if (regmap_read(sc->regmap, reg, &val))
+			seq_printf(s, "0x%02x: error\n", reg);
+		else
+			seq_printf(s, "0x%02x: 0x%02x\n", reg, val);
+	}
+
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(sc8541_dbg_regs);
+
+static int sc8541_dbg_adc_show(struct seq_file *s, void *unused)
+{
+	struct sc8541 *sc = s->private;
+	int ch, val;
+
+	seq_printf(s, "adc_enabled %d\n", sc8541_adc_enabled(sc));
+	for (ch = 0; ch < SC8541_ADC_NUM; ch++) {
+		if (sc8541_read_adc(sc, ch, &val))
+			seq_printf(s, "%s error\n", sc8541_adc_scale[ch].name);
+		else
+			seq_printf(s, "%s %d\n", sc8541_adc_scale[ch].name, val);
+	}
+
+	return 0;
+}
+
+static int sc8541_dbg_adc_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, sc8541_dbg_adc_show, inode->i_private);
+}
+
+/* Writing 1 starts the ADC alone, for readings with switching off */
+static ssize_t sc8541_dbg_adc_write(struct file *file, const char __user *ubuf,
+				    size_t count, loff_t *ppos)
+{
+	struct sc8541 *sc = file_inode(file)->i_private;
+	bool on;
+	int ret;
+
+	ret = kstrtobool_from_user(ubuf, count, &on);
+	if (ret)
+		return ret;
+	if (!on)
+		return -EINVAL;
+
+	mutex_lock(&sc->lock);
+	ret = sc8541_write_check(sc, SC8541_ADC_CTRL2, 0xff, 0);
+	ret = ret ?: sc8541_write_check(sc, SC8541_ADC_CTRL1, 0xc3,
+					SC8541_ADC_EN);
+	mutex_unlock(&sc->lock);
+
+	return ret ?: count;
+}
+
+static const struct file_operations sc8541_dbg_adc_fops = {
+	.owner = THIS_MODULE,
+	.open = sc8541_dbg_adc_open,
+	.read = seq_read,
+	.write = sc8541_dbg_adc_write,
+	.llseek = seq_lseek,
+	.release = single_release,
+};
+
+static void sc8541_stop(void *data)
+{
+	struct sc8541 *sc = data;
+
+	scoped_guard(mutex, &sc->lock)
+		sc->removing = true;
+	debugfs_remove_recursive(sc->dbg);
+	if (sc8541_disable_sync(sc))
+		dev_err(sc->dev, "unable to confirm stop during removal\n");
+}
+
+/* An in-flight set_property(ONLINE=0) can schedule its final guard after
+ * stop(). The power-supply core drains callbacks during unregister.
+ */
+static void sc8541_cancel_watch(void *data)
+{
+	struct sc8541 *sc = data;
+
+	cancel_delayed_work_sync(&sc->watch);
+}
+
+static const struct regmap_config sc8541_regmap_config = {
+	.reg_bits = 8,
+	.val_bits = 8,
+	.max_register = SC8541_MAX_REG,
+	.cache_type = REGCACHE_NONE,
+};
+
+static int sc8541_probe(struct i2c_client *client)
+{
+	struct device *dev = &client->dev;
+	struct power_supply_config cfg = {};
+	struct sc8541 *sc;
+	unsigned int id, ctrl;
+	int ret;
+
+	sc = devm_kzalloc(dev, sizeof(*sc), GFP_KERNEL);
+	if (!sc)
+		return -ENOMEM;
+
+	sc->dev = dev;
+	sc->busocp_ma = SC8541_BUSOCP_MA;
+	mutex_init(&sc->lock);
+	INIT_DELAYED_WORK(&sc->watch, sc8541_watch);
+
+	sc->regmap = devm_regmap_init_i2c(client, &sc8541_regmap_config);
+	if (IS_ERR(sc->regmap))
+		return PTR_ERR(sc->regmap);
+
+	ret = regmap_read(sc->regmap, SC8541_DEVICE_INFO, &id);
+	if (ret)
+		return dev_err_probe(dev, ret, "failed to read the device id\n");
+	if (id != SC8541_DEVICE_ID)
+		return dev_err_probe(dev, -ENODEV, "unknown device id 0x%02x\n", id);
+
+	ret = regmap_read(sc->regmap, SC8541_CTRL2, &ctrl);
+	if (ret)
+		return ret;
+	/* Nobody may have left it switching: no caller is driving the source */
+	if (ctrl & SC8541_CHG_EN) {
+		dev_warn(dev, "found switching on, turning it off\n");
+		ret = sc8541_stop_switching(sc);
+		if (ret)
+			return ret;
+	}
+
+	ret = devm_add_action_or_reset(dev, sc8541_cancel_watch, sc);
+	if (ret)
+		return ret;
+
+	cfg.drv_data = sc;
+	cfg.fwnode = dev_fwnode(dev);
+	sc->psy = devm_power_supply_register(dev, &sc8541_desc, &cfg);
+	if (IS_ERR(sc->psy))
+		return dev_err_probe(dev, PTR_ERR(sc->psy),
+				     "failed to register the power supply\n");
+
+	sc->dbg = debugfs_create_dir(dev_name(dev), NULL);
+	debugfs_create_file("regs", 0400, sc->dbg, sc, &sc8541_dbg_regs_fops);
+	debugfs_create_file("adc", 0600, sc->dbg, sc, &sc8541_dbg_adc_fops);
+
+	/* Drain the stage before devres unregisters the power supply. */
+	ret = devm_add_action_or_reset(dev, sc8541_stop, sc);
+	if (ret)
+		return ret;
+
+	i2c_set_clientdata(client, sc);
+	dev_info(dev, "SC8541 (ctrl 0x%02x)\n", ctrl);
+
+	return 0;
+}
+
+static void sc8541_shutdown(struct i2c_client *client)
+{
+	sc8541_disable_sync(i2c_get_clientdata(client));
+}
+
+static int sc8541_suspend(struct device *dev)
+{
+	return sc8541_quiesce(dev_get_drvdata(dev));
+}
+
+static DEFINE_SIMPLE_DEV_PM_OPS(sc8541_pm_ops, sc8541_suspend, NULL);
+
+static const struct i2c_device_id sc8541_i2c_ids[] = {
+	{ "sc8541" },
+	{ }
+};
+MODULE_DEVICE_TABLE(i2c, sc8541_i2c_ids);
+
+static const struct of_device_id sc8541_of_match[] = {
+	{ .compatible = "southchip,sc8541" },
+	{ }
+};
+MODULE_DEVICE_TABLE(of, sc8541_of_match);
+
+static struct i2c_driver sc8541_driver = {
+	.driver = {
+		.name = "sc8541-charger",
+		.of_match_table = sc8541_of_match,
+		.pm = pm_sleep_ptr(&sc8541_pm_ops),
+	},
+	.probe = sc8541_probe,
+	.shutdown = sc8541_shutdown,
+	.id_table = sc8541_i2c_ids,
+};
+module_i2c_driver(sc8541_driver);
+
+MODULE_DESCRIPTION("Southchip SC8541 switched-capacitor direct charger");
+MODULE_LICENSE("GPL");
+
+#if IS_ENABLED(CONFIG_CHARGER_SC8541_KUNIT_TEST)
+#include "sc8541_charger_test.c"
+#endif

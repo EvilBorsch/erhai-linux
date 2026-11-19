@@ -1,0 +1,81 @@
+# SPDX-License-Identifier: GPL-2.0-only OR BSD-2-Clause
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/leds/irled/ir-spi-led.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: IR LED connected through SPI bus
+
+maintainers:
+  - Sean Young <sean@mess.org>
+
+description:
+  IR LED switch is connected to the MOSI line of the SPI device and the data
+  is delivered through that.
+
+properties:
+  compatible:
+    enum:
+      - ir-spi-led
+      - xiaomi,piano-ir-spi
+
+  reg:
+    maxItems: 1
+
+  duty-cycle:
+    $ref: /schemas/types.yaml#/definitions/uint8
+    enum: [30, 50, 60, 70, 75, 80, 90]
+    description:
+      Percentage of one period in which the signal is active.
+
+  led-active-low:
+    type: boolean
+    description:
+      Output is negated with a NOT gate.
+
+  power-supply: true
+
+required:
+  - compatible
+  - reg
+
+unevaluatedProperties: false
+
+allOf:
+  - $ref: /schemas/spi/spi-peripheral-props.yaml#
+  - if:
+      properties:
+        compatible:
+          const: xiaomi,piano-ir-spi
+    then:
+      description: |
+        Piano uses SPI mode 0, a fixed 1.92 MHz sample clock and native
+        MSB-first 32-bit words, with low-level spaces and 40 percent duty
+        by default. The
+        factory device has no described software-controlled IR supply.
+        Runtime carrier and duty requests use the normal LIRC interface.
+      properties:
+        duty-cycle: false
+        led-active-low: false
+        power-supply: false
+        spi-cpol: false
+        spi-cpha: false
+        spi-cs-high: false
+        spi-lsb-first: false
+
+examples:
+  - |
+    spi {
+        #address-cells = <1>;
+        #size-cells = <0>;
+
+        irled@0 {
+            compatible = "ir-spi-led";
+            reg = <0x0>;
+
+            duty-cycle = /bits/ 8 <60>;
+            led-active-low;
+            power-supply = <&irda_regulator>;
+            spi-max-frequency = <5000000>;
+        };
+    };
