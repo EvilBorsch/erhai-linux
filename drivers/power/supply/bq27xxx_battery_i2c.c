@@ -10,11 +10,16 @@
 #include <linux/i2c.h>
 #include <linux/interrupt.h>
 #include <linux/module.h>
+#include <linux/property.h>
 #include <linux/unaligned.h>
 
 #include <linux/power/bq27xxx_battery.h>
 
 static DEFINE_IDA(battery_id);
+
+/* Probes of a gauge that may not be fitted, and the time between them */
+#define BQ27XXX_I2C_FITTED_TRIES	5
+#define BQ27XXX_I2C_FITTED_WAIT_MS	50
 
 static irqreturn_t bq27xxx_battery_irq_handler_thread(int irq, void *data)
 {
@@ -153,6 +158,36 @@ static void bq27xxx_battery_i2c_devm_ida_free(void *data)
 	ida_free(&battery_id, num);
 }
 
+/*
+ * A gauge that measures the battery of a charger firmware (oplus,charger-gauge)
+ * is fitted on some variants of a board only, and they share one device
+ * tree. Where it is not fitted, nothing acknowledges its address and the
+ * battery registered for it could never report anything. Only an address
+ * that stays unacknowledged counts as that: a gauge that answers once, or
+ * a transfer that fails in any other way, leaves the gauge in place.
+ */
+static bool bq27xxx_battery_i2c_not_fitted(struct i2c_client *client)
+{
+	u8 reg = 0, data[2];
+	struct i2c_msg msg[] = {
+		{ .addr = client->addr, .len = sizeof(reg), .buf = &reg },
+		{ .addr = client->addr, .flags = I2C_M_RD, .len = sizeof(data), .buf = data },
+	};
+	unsigned int i;
+
+	if (!device_property_read_bool(&client->dev, "oplus,charger-gauge"))
+		return false;
+
+	for (i = 0; i < BQ27XXX_I2C_FITTED_TRIES; i++) {
+		if (i)
+			msleep(BQ27XXX_I2C_FITTED_WAIT_MS);
+		if (i2c_transfer(client->adapter, msg, ARRAY_SIZE(msg)) != -ENXIO)
+			return false;
+	}
+
+	return true;
+}
+
 static int bq27xxx_battery_i2c_probe(struct i2c_client *client)
 {
 	const struct i2c_device_id *id = i2c_client_get_device_id(client);
@@ -160,6 +195,11 @@ static int bq27xxx_battery_i2c_probe(struct i2c_client *client)
 	int ret;
 	char *name;
 	long num;
+
+	if (bq27xxx_battery_i2c_not_fitted(client)) {
+		dev_info(&client->dev, "no gauge at this address, not registering a battery\n");
+		return -ENODEV;
+	}
 
 	/* Get new ID for the new battery device */
 	num = ida_alloc(&battery_id, GFP_KERNEL);
