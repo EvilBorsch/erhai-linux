@@ -9,6 +9,7 @@
 #include <linux/cleanup.h>
 #include <linux/platform_device.h>
 #include <linux/delay.h>
+#include <linux/i2c.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/nvmem-consumer.h>
@@ -202,6 +203,8 @@ enum qcom_battmgr_variant {
 #define PD_DEFAULT_MV			5000
 /* PM8550: top HAL usb_icl[] step, also used for the PPS buck path. */
 #define PD_INPUT_MAX_UA			3000000
+/* Stock oplus_spec,pd-iclmax-ma: 18 W from a 9 V source. */
+#define PD_INPUT_STOCK_UA		2000000
 /* 24924 common.dtsi input-power-mw: 10 W for VOOC/DCP at 5 V. */
 #define ERHAI_SERIAL_5V_UA		2000000
 #define PD_TRANSITION_UA			500000
@@ -230,6 +233,13 @@ enum qcom_battmgr_pd_event {
 	PD_EVENT_DETACH,
 	PD_EVENT_SVOOC_RESPONSE,
 	PD_EVENT_UFCS_RESPONSE,
+};
+
+/* Whether the gauge of oplus,external-gauge is fitted on this board. */
+enum qcom_battmgr_gauge_state {
+	GAUGE_UNKNOWN,
+	GAUGE_PRESENT,
+	GAUGE_ABSENT,
 };
 
 /* Successful delivery and discovery attempts belong to this attachment. */
@@ -474,6 +484,13 @@ struct qcom_battmgr {
 	struct power_supply *ac_psy;
 	struct power_supply *bat_psy;
 	struct power_supply *gauge;	/* oplus,external-gauge */
+	/*
+	 * Written by the charge worker under @charge_lock, see
+	 * qcom_battmgr_gauge_detect(); read without it.
+	 */
+	enum qcom_battmgr_gauge_state gauge_state;
+	unsigned int gauge_polls, gauge_nacks;
+	unsigned long gauge_poll_at;
 	struct power_supply *usb_psy;
 	struct power_supply *wls_psy;
 
@@ -548,6 +565,8 @@ struct qcom_battmgr {
 	bool pps_suspended;
 	bool pps_input_used;
 	const struct erhai_pps_ops *pps_ops;
+	/* Registered, but held back until the pack gauge has answered. */
+	const struct erhai_pps_ops *pps_parked;
 	void *pps_data;
 
 	/* Fixed PD shares @charge_work and @charge_lock with PPS. */
@@ -713,7 +732,24 @@ static int qcom_battmgr_set_property(struct qcom_battmgr *battmgr, int opcode,
 	return ret;
 }
 
-/* Read the raw value of a battery or USB property */
+/* Read the raw value of a battery or USB property from the firmware */
+static int qcom_battmgr_firmware_property(struct qcom_battmgr *battmgr, int opcode,
+					  u32 property, u32 *value)
+{
+	int ret;
+
+	mutex_lock(&battmgr->lock);
+	battmgr->resp_property = U32_MAX;
+	ret = qcom_battmgr_request_property(battmgr, opcode, property, 0);
+	if (!ret && battmgr->resp_property != property)
+		ret = -EIO;
+	if (!ret)
+		*value = battmgr->resp_value;
+	mutex_unlock(&battmgr->lock);
+
+	return ret;
+}
+
 /*
  * Erhai keeps the pack gauge (TI bq27z561) on AP I2C, as the stock device
  * tree says (oplus_spec,external_gauge_support). The ADSP charger firmware
@@ -724,8 +760,33 @@ static int qcom_battmgr_set_property(struct qcom_battmgr *battmgr, int opcode,
  * those defaults. The stock pack is identified by the design capacity
  * programmed in its gauge: 11410 mAh, the rated minimum of the 12140 mAh
  * typical pack (oplus,batt_capacity_mah) of the stock device tree.
+ *
+ * Not every Erhai has that gauge. The stock overlays with oplus,gauge-id 1
+ * leave the bq27z561 out: there the firmware gauges the pack itself
+ * (oplus,adsp_gauge), nothing answers at the gauge's address and the pack
+ * is authenticated over a 1-wire chip this kernel has no driver for. Both
+ * variants boot the same device tree, so the charge worker settles which
+ * one this is, see qcom_battmgr_gauge_detect(). Until it has, and for good
+ * once the gauge has answered, all of the above holds. Only when the gauge
+ * is found absent do the battery readings come from the firmware, as on
+ * any other board of this firmware family. They are not used to steer the
+ * charge: the pumps stay unregistered and the AP sets no float voltage and
+ * no charge current of its own, see qcom_battmgr_buck_guard().
  */
 #define ERHAI_PACK_DESIGN_UAH		11410000
+
+/* What the firmware reports for a pack it does not gauge, see above. */
+#define ERHAI_FW_DEFAULT_UV		4000000
+#define ERHAI_FW_DEFAULT_CENTI_C	2500
+#define ERHAI_FW_DEFAULT_CENTI_PCT	5000
+
+/*
+ * One probe a second for the first minute, then at the charge poll rate.
+ * The gauge is absent once this many probes in a row were not acknowledged.
+ */
+#define GAUGE_DETECT_MS			1000
+#define GAUGE_DETECT_FAST_POLLS		60
+#define GAUGE_ABSENT_NACKS		10
 
 static struct power_supply *qcom_battmgr_gauge(struct qcom_battmgr *b)
 {
@@ -741,9 +802,36 @@ static struct power_supply *qcom_battmgr_gauge(struct qcom_battmgr *b)
 	return READ_ONCE(b->gauge);
 }
 
-static bool qcom_battmgr_has_gauge(struct qcom_battmgr *b)
+/* The device tree names a pack gauge; it may still turn out not fitted. */
+static bool qcom_battmgr_gauge_described(struct qcom_battmgr *b)
 {
 	return of_property_present(b->dev->of_node, "oplus,external-gauge");
+}
+
+/* The battery readings come from the pack gauge. */
+static bool qcom_battmgr_has_gauge(struct qcom_battmgr *b)
+{
+	return qcom_battmgr_gauge_described(b) &&
+	       READ_ONCE(b->gauge_state) != GAUGE_ABSENT;
+}
+
+/* The gauge of the device tree is not fitted: the firmware gauges the pack. */
+static bool qcom_battmgr_gaugeless(struct qcom_battmgr *b)
+{
+	return READ_ONCE(b->gauge_state) == GAUGE_ABSENT;
+}
+
+static const char *qcom_battmgr_gauge_name(struct qcom_battmgr *b)
+{
+	static const char * const names[] = {
+		[GAUGE_UNKNOWN] = "detecting",
+		[GAUGE_PRESENT] = "present",
+		[GAUGE_ABSENT] = "absent",
+	};
+
+	if (!qcom_battmgr_gauge_described(b))
+		return "none";
+	return names[READ_ONCE(b->gauge_state)];
 }
 
 static void qcom_battmgr_put_gauge(void *data)
@@ -768,6 +856,61 @@ static int qcom_battmgr_gauge_read(struct qcom_battmgr *b,
 	if (!ret)
 		*value = val.intval;
 	return ret;
+}
+
+/*
+ * Address the gauge directly, whether or not its driver is bound: 1 if it
+ * acknowledged, 0 if it did not, an error if the probe says nothing about
+ * it (its bus has not probed yet, a timeout, a bus error). Only the address
+ * phase matters; reading its first command register changes nothing.
+ */
+static int qcom_battmgr_gauge_ping(struct qcom_battmgr *b)
+{
+#if IS_REACHABLE(CONFIG_I2C)
+	struct fwnode_handle *fwnode;
+	struct i2c_client *client;
+	struct i2c_msg msg[2];
+	u8 reg = 0, data[2];
+	int ret;
+
+	fwnode = fwnode_find_reference(dev_fwnode(b->dev), "oplus,external-gauge", 0);
+	if (IS_ERR(fwnode))
+		return PTR_ERR(fwnode);
+	client = i2c_find_device_by_fwnode(fwnode);
+	fwnode_handle_put(fwnode);
+	if (!client)
+		return -ENODEV;
+
+	msg[0] = (struct i2c_msg){ .addr = client->addr, .len = sizeof(reg), .buf = &reg };
+	msg[1] = (struct i2c_msg){ .addr = client->addr, .flags = I2C_M_RD,
+				   .len = sizeof(data), .buf = data };
+	ret = i2c_transfer(client->adapter, msg, ARRAY_SIZE(msg));
+	put_device(&client->dev);
+	if (ret == -ENXIO)
+		return 0;
+	return ret < 0 ? ret : 1;
+#else
+	return -EOPNOTSUPP;
+#endif
+}
+
+/*
+ * The firmware gauges the pack itself: it answers with a battery that is
+ * not the set of defaults it reports for a pack whose gauge it cannot read.
+ */
+static bool qcom_battmgr_firmware_gauge(struct qcom_battmgr *b)
+{
+	u32 uv, ua, temp, soc;
+
+	if (qcom_battmgr_firmware_property(b, BATTMGR_BAT_PROPERTY_GET, BATT_VOLT_NOW, &uv) ||
+	    qcom_battmgr_firmware_property(b, BATTMGR_BAT_PROPERTY_GET, BATT_CURR_NOW, &ua) ||
+	    qcom_battmgr_firmware_property(b, BATTMGR_BAT_PROPERTY_GET, BATT_TEMP, &temp) ||
+	    qcom_battmgr_firmware_property(b, BATTMGR_BAT_PROPERTY_GET, BATT_CAPACITY, &soc))
+		return false;
+	if (!uv || soc > 10000 || ua == BIT(31))
+		return false;
+	return uv != ERHAI_FW_DEFAULT_UV || ua || temp != ERHAI_FW_DEFAULT_CENTI_C ||
+	       soc != ERHAI_FW_DEFAULT_CENTI_PCT;
 }
 
 /* The stock pack, by the design capacity programmed in its gauge. */
@@ -823,6 +966,8 @@ static int qcom_battmgr_gauge_property(struct qcom_battmgr *b, u32 property,
 	return ret;
 }
 
+static void qcom_battmgr_buck_invalidate(struct qcom_battmgr *b);
+
 static int qcom_battmgr_get_property(struct qcom_battmgr *battmgr, int opcode,
 				     u32 property, u32 *value)
 {
@@ -833,17 +978,78 @@ static int qcom_battmgr_get_property(struct qcom_battmgr *battmgr, int opcode,
 		if (ret != -EOPNOTSUPP)
 			return ret;
 	}
+	/* Without its gauge nothing here tells the stock pack from another. */
+	if (opcode == BATTMGR_BAT_PROPERTY_GET && qcom_battmgr_gaugeless(battmgr) &&
+	    (property == BATT_OPLUS_AUTH || property == BATT_OPLUS_HMAC)) {
+		*value = 0;
+		return 0;
+	}
 
-	mutex_lock(&battmgr->lock);
-	battmgr->resp_property = U32_MAX;
-	ret = qcom_battmgr_request_property(battmgr, opcode, property, 0);
-	if (!ret && battmgr->resp_property != property)
-		ret = -EIO;
-	if (!ret)
-		*value = battmgr->resp_value;
-	mutex_unlock(&battmgr->lock);
+	return qcom_battmgr_firmware_property(battmgr, opcode, property, value);
+}
 
-	return ret;
+/*
+ * Settle whether this board has the gauge of its device tree. Called by the
+ * charge worker, with the firmware service up, until it is settled; returns
+ * the time to the next attempt in ms, 0 once there is none.
+ *
+ * Present: a gauge reading succeeded, or the gauge acknowledged its address
+ * while its driver has yet to bind. One answer settles it for good: a gauge
+ * that fails later is an error as before, never a fallback.
+ *
+ * Absent: nothing has ever answered, GAUGE_ABSENT_NACKS probes at least
+ * GAUGE_DETECT_MS apart all ended in an address NACK, and the firmware
+ * reports a pack it gauges itself. A probe that fails any other way, such
+ * as a timeout, a bus error or a bus that has yet to probe, says nothing
+ * and starts the count over, and so does not turn a fitted gauge absent.
+ */
+static unsigned int qcom_battmgr_gauge_detect(struct qcom_battmgr *b)
+{
+	unsigned long next;
+	unsigned int wait;
+	int value, ret;
+
+	if (b->gauge_state != GAUGE_UNKNOWN || !qcom_battmgr_gauge_described(b))
+		return 0;
+
+	wait = b->gauge_polls < GAUGE_DETECT_FAST_POLLS ? GAUGE_DETECT_MS :
+							  CHARGE_CTRL_POLL_MS;
+	next = b->gauge_poll_at + msecs_to_jiffies(wait);
+	if (b->gauge_polls && time_before(jiffies, next))
+		return jiffies_to_msecs(next - jiffies) ?: 1;
+	b->gauge_poll_at = jiffies;
+	b->gauge_polls++;
+
+	if (!qcom_battmgr_gauge_read(b, POWER_SUPPLY_PROP_VOLTAGE_NOW, &value))
+		ret = 1;
+	else
+		ret = qcom_battmgr_gauge_ping(b);
+	if (ret > 0) {
+		WRITE_ONCE(b->gauge_state, GAUGE_PRESENT);
+		if (b->pps_parked) {
+			b->pps_ops = b->pps_parked;
+			b->pps_parked = NULL;
+		}
+		return 0;
+	}
+	if (ret < 0) {
+		b->gauge_nacks = 0;
+		return wait;
+	}
+	if (++b->gauge_nacks < GAUGE_ABSENT_NACKS)
+		return wait;
+	b->gauge_nacks = GAUGE_ABSENT_NACKS;
+	if (!qcom_battmgr_firmware_gauge(b))
+		return wait;
+
+	WRITE_ONCE(b->gauge_state, GAUGE_ABSENT);
+	/* The supervisor had no readings so far; the guard starts afresh. */
+	b->buck = (struct erhai_buck){};
+	b->buck_error = 0;
+	qcom_battmgr_buck_invalidate(b);
+	dev_info(b->dev, "pack gauge not fitted: battery readings from the charger firmware, no AP fast charging\n");
+	power_supply_changed(b->bat_psy);
+	return 0;
 }
 
 static int qcom_battmgr_update_status(struct qcom_battmgr *battmgr)
@@ -1099,7 +1305,9 @@ static int qcom_battmgr_bat_get_property(struct power_supply *psy,
 				val->intval = POWER_SUPPLY_STATUS_NOT_CHARGING;
 			else if ((s32)raw_ua < 0)
 				val->intval = POWER_SUPPLY_STATUS_CHARGING;
+			/* Without the gauge full is the firmware's decision. */
 			else if (READ_ONCE(battmgr->buck.phase) != ERHAI_BUCK_OFF &&
+				 !qcom_battmgr_gaugeless(battmgr) &&
 				 val->intval == POWER_SUPPLY_STATUS_FULL)
 				val->intval = POWER_SUPPLY_STATUS_NOT_CHARGING;
 			val->intval = erhai_battery_status(val->intval, -(s32)raw_ua);
@@ -1735,6 +1943,7 @@ static ssize_t charge_contract_show(struct device *dev, struct device_attribute 
 		b->buck_gauge_error,
 		b->buck_sample.mv, b->buck_sample.ma, b->buck_sample.temp,
 		b->buck_sample_at ? (long long)jiffies_to_msecs(jiffies - b->buck_sample_at) : -1LL);
+	len += sysfs_emit_at(buf, len, "gauge=%s ", qcom_battmgr_gauge_name(b));
 	if (b->pps_ops)
 		return b->pps_ops->describe(b->pps_data, buf, len);
 	return len + sysfs_emit_at(buf, len, "state=idle\n");
@@ -1797,6 +2006,9 @@ static int qcom_battmgr_pd_fcc(struct qcom_battmgr *b)
 	int ret;
 
 	if (b->buck.phase != ERHAI_BUCK_OFF && b->buck.phase != ERHAI_BUCK_NORMAL)
+		return 0;
+	/* The charge current stays the firmware's own without the gauge. */
+	if (qcom_battmgr_gaugeless(b))
 		return 0;
 
 	ret = qcom_battmgr_get_property(b, BATTMGR_BAT_PROPERTY_GET, BATT_CHG_CTRL_LIM, &current_fcc);
@@ -2258,6 +2470,74 @@ static int qcom_battmgr_buck_read(struct qcom_battmgr *b, struct erhai_buck_samp
 	return 0;
 }
 
+/*
+ * Without the pack gauge the firmware charges by itself: from its own
+ * gauge, to its own float voltage and at its own current, as it does on the
+ * boards of its family that have no AP charge controller. The AP adjusts
+ * none of that. It only takes the charge output away where the stock
+ * charger would not charge at this rate either and the AP, steering
+ * nothing, cannot charge more slowly instead: below 0 C and from 53 C, from
+ * 45 C once the cell is above the warm float voltage until it has fallen to
+ * the warm recharge voltage, and from the battery overvoltage threshold
+ * until 200 mV below it (batt-them-thr, fv-mv and vbatt-ov-thr-mv of the
+ * stock charger devicetree). Without a reading it takes it away as well.
+ */
+static unsigned int qcom_battmgr_buck_guard(struct qcom_battmgr *b)
+{
+	struct erhai_buck *buck = &b->buck;
+	bool disable;
+	u32 uv, temp;
+	int mv, ret;
+
+	if (buck->phase == ERHAI_BUCK_OFF)
+		erhai_buck_start(buck, jiffies);
+	if (time_before(jiffies, buck->next_sample) && !b->buck_error)
+		return jiffies_to_msecs(buck->next_sample - jiffies) ?: 1;
+
+	ret = qcom_battmgr_get_property(b, BATTMGR_BAT_PROPERTY_GET, BATT_VOLT_NOW, &uv);
+	ret = ret ?: qcom_battmgr_get_property(b, BATTMGR_BAT_PROPERTY_GET, BATT_TEMP, &temp);
+	if (!ret && !uv)
+		ret = -ENODATA;
+	if (ret)
+		goto fail;
+	mv = uv / 1000;
+	b->buck_sample = (struct erhai_buck_sample){ .mv = mv, .temp = (s32)temp / 10 };
+	b->buck_sample_at = jiffies;
+	buck->next_sample = jiffies + msecs_to_jiffies(4000);
+
+	erhai_buck_temperature(buck, b->buck_sample.temp);
+	if (mv >= 4600)
+		buck->over_voltage = true;
+	else if (mv < 4400)
+		buck->over_voltage = false;
+	disable = buck->temp_region < 2 || buck->temp_region > 7 || buck->over_voltage;
+	if (buck->temp_region == 7 && mv > (buck->disable ? 4030 : 4130))
+		disable = true;
+
+	if (disable != buck->disable || b->buck_error)
+		dev_info(b->dev, "charge output %s: cell %d mV, %s%d.%d C\n",
+			 disable ? "withdrawn" : "allowed", mv,
+			 b->buck_sample.temp < 0 ? "-" : "",
+			 abs(b->buck_sample.temp) / 10, abs(b->buck_sample.temp) % 10);
+	if (disable != buck->disable)
+		power_supply_changed(b->bat_psy);
+	buck->disable = disable;
+	ret = qcom_battmgr_buck_write(b, BATT_OPLUS_CHG_EN,
+				      !disable && !b->charge_policy_hold && !b->charge_inhibited,
+				      &b->buck_enable_applied);
+	if (ret)
+		goto fail;
+	b->buck_error = 0;
+	return 4000;
+
+fail:
+	if (b->buck_error != ret)
+		dev_warn(b->dev, "charge guard failed: %d; withdrawing charge output\n", ret);
+	b->buck_error = ret;
+	qcom_battmgr_buck_pause(b);
+	return PD_POLL_MS;
+}
+
 static unsigned int qcom_battmgr_buck_tick(struct qcom_battmgr *b)
 {
 	struct erhai_buck_sample sample;
@@ -2267,6 +2547,8 @@ static unsigned int qcom_battmgr_buck_tick(struct qcom_battmgr *b)
 
 	if (!b->buck_online || READ_ONCE(b->otg_request))
 		return 0;
+	if (qcom_battmgr_gaugeless(b))
+		return qcom_battmgr_buck_guard(b);
 	qcom_battmgr_tail_owned(b); /* A pump may have just published completion. */
 	if (b->serial_probe || qcom_battmgr_pps_running(b) ||
 	    (b->pps_ops && b->pps_ops->ufcs_active(b->pps_data)))
@@ -2823,6 +3105,12 @@ fixed_contract:
 		} else {
 			ret = qcom_battmgr_pd_current(battmgr, PD_FIXED_MV, &ua);
 		}
+		/*
+		 * Without the gauge the firmware alone limits what the buck
+		 * passes on to the cell: do not offer it more than stock does.
+		 */
+		if (qcom_battmgr_gaugeless(battmgr))
+			ua = min(ua, (u32)PD_INPUT_STOCK_UA);
 		if (ret || !ua) {
 			dev_info(battmgr->dev, "PD: no verified 9 V fixed PDO (error %d)\n", ret);
 			if (qcom_battmgr_pd_stop(battmgr, false, "source capabilities") ||
@@ -2997,7 +3285,7 @@ static void qcom_battmgr_charge_worker(struct work_struct *work)
 {
 	struct qcom_battmgr *battmgr = container_of(to_delayed_work(work),
 						    struct qcom_battmgr, charge_work);
-	unsigned int delay = 0, buck_delay;
+	unsigned int delay = 0, buck_delay, gauge_delay;
 
 	/* Kicked again by qcom_battmgr_enable_worker() once the service is up */
 	if (READ_ONCE(battmgr->removing) || READ_ONCE(battmgr->pps_suspended))
@@ -3014,6 +3302,8 @@ static void qcom_battmgr_charge_worker(struct work_struct *work)
 		return;
 	}
 
+	gauge_delay = qcom_battmgr_gauge_detect(battmgr);
+
 	qcom_battmgr_charge_limit_update(battmgr);
 
 	if (battmgr->quirks & QCOM_BATTMGR_QUIRK_OPLUS_PD)
@@ -3025,6 +3315,8 @@ static void qcom_battmgr_charge_worker(struct work_struct *work)
 	}
 	if (delay && battmgr->tail_owned)
 		delay = min(delay, 4000U);
+	if (gauge_delay)
+		delay = delay ? min(delay, gauge_delay) : gauge_delay;
 
 	/* Also retry turning charging back on after the limit was removed */
 	if (!delay && (qcom_battmgr_charge_limited(battmgr) ||
@@ -4641,10 +4933,20 @@ int erhai_pps_register(struct device *parent, const struct erhai_pps_ops *ops, v
 	struct qcom_battmgr *battmgr = dev_get_drvdata(parent);
 
 	guard(mutex)(&battmgr->charge_lock);
-	if (battmgr->pps_ops)
+	if (battmgr->pps_ops || battmgr->pps_parked)
 		return -EBUSY;
 	battmgr->pps_data = data;
-	battmgr->pps_ops = ops;
+	/*
+	 * The pumps charge the cell directly, on the pack gauge's readings.
+	 * Where the device tree names that gauge they are only let in once
+	 * it has answered, see qcom_battmgr_gauge_detect(), and so never on
+	 * a board that turns out not to have it.
+	 */
+	if (qcom_battmgr_gauge_described(battmgr) &&
+	    battmgr->gauge_state != GAUGE_PRESENT)
+		battmgr->pps_parked = ops;
+	else
+		battmgr->pps_ops = ops;
 	qcom_battmgr_charge_kick(battmgr);
 	return 0;
 }
@@ -4657,6 +4959,7 @@ void erhai_pps_unregister(struct device *parent)
 	guard(mutex)(&battmgr->charge_lock);
 	qcom_battmgr_pps_stop(battmgr, false, "PPS-unregister");
 	battmgr->pps_ops = NULL;
+	battmgr->pps_parked = NULL;
 	battmgr->pps_data = NULL;
 	set_bit(PD_EVENT_CAPS, &battmgr->pd_events);
 	qcom_battmgr_charge_kick(battmgr);
