@@ -522,9 +522,12 @@ struct qcom_battmgr {
 	 * on a freezable workqueue, so no request is sent while the system
 	 * is suspended.  @charge_inhibited is set while the driver holds
 	 * charging off, @charge_error while the firmware refuses to switch.
+	 * @charge_bypass holds charging off regardless of the thresholds, so
+	 * a connected charger powers the system while the battery rests.
 	 */
 	struct delayed_work charge_work;
 	bool charge_inhibited;
+	bool charge_bypass;
 	bool charge_error;
 	bool charge_policy_hold;
 	struct wakeup_source *charge_ws;
@@ -948,7 +951,8 @@ static bool qcom_battmgr_charge_ctrl_local(struct qcom_battmgr *battmgr,
 		return false;
 
 	return psp == POWER_SUPPLY_PROP_CHARGE_CONTROL_START_THRESHOLD ||
-	       psp == POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD;
+	       psp == POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD ||
+	       psp == POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR;
 }
 
 static int qcom_battmgr_bat_sc8280xp_update(struct qcom_battmgr *battmgr,
@@ -1205,6 +1209,11 @@ static int qcom_battmgr_bat_get_property(struct power_supply *psy,
 	case POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD:
 		val->intval = battmgr->info.charge_ctrl_end;
 		break;
+	case POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR:
+		val->intval = READ_ONCE(battmgr->charge_bypass) ?
+			      POWER_SUPPLY_CHARGE_BEHAVIOUR_INHIBIT_CHARGE :
+			      POWER_SUPPLY_CHARGE_BEHAVIOUR_AUTO;
+		break;
 	case POWER_SUPPLY_PROP_MANUFACTURE_YEAR:
 		val->intval = battmgr->info.year;
 		break;
@@ -1343,7 +1352,8 @@ static bool qcom_battmgr_charge_limited(struct qcom_battmgr *battmgr)
 {
 	unsigned int end = READ_ONCE(battmgr->info.charge_ctrl_end);
 
-	return end && end < CHARGE_CTRL_END_THR_MAX;
+	return READ_ONCE(battmgr->charge_bypass) ||
+	       (end && end < CHARGE_CTRL_END_THR_MAX);
 }
 
 /* The ADSP USB_ADAP_TYPE identifies the two computer-port exceptions.
@@ -1427,6 +1437,17 @@ static void qcom_battmgr_charge_limit_update(struct qcom_battmgr *battmgr)
 		return;
 
 	soc = battmgr->status.percent;
+	if (READ_ONCE(battmgr->charge_bypass)) {
+		if (!battmgr->charge_inhibited || battmgr->charge_error) {
+			battmgr->charge_policy_hold = true;
+			if (!qcom_battmgr_charge_enable(battmgr, false)) {
+				battmgr->charge_inhibited = true;
+				dev_info(battmgr->dev, "bypass charging on\n");
+			}
+		}
+		return;
+	}
+
 	if (soc >= end)
 		battmgr->charge_policy_hold = true;
 	else if (soc <= start)
@@ -2336,7 +2357,7 @@ static unsigned int qcom_battmgr_pd_update(struct qcom_battmgr *battmgr)
 	struct qcom_battmgr_pd_source src = { .battmgr = battmgr };
 	struct erhai_probe_status status = {};
 	bool stable, ufcs_active, tail, probe_idle, prefer_pps, dedicated, can_probe, can_probe_pumps;
-	bool serial_source, detached, qc, try_qc, caps_changed, current_changed = false;
+	bool serial_source, detached, qc, try_qc, caps_changed, current_changed = false, bypass;
 	u32 online, type = POWER_SUPPLY_USB_TYPE_UNKNOWN, health, vbat, vbus, ua, real_type;
 	int ret;
 
@@ -2772,10 +2793,17 @@ fixed_contract:
 	if (qcom_battmgr_get_property(battmgr, BATTMGR_BAT_PROPERTY_GET, BATT_HEALTH, &health) ||
 	    qcom_battmgr_get_property(battmgr, BATTMGR_BAT_PROPERTY_GET, BATT_VOLT_NOW, &vbat))
 		return CHARGE_CTRL_POLL_MS;
-	if (battmgr->charge_inhibited || battmgr->charge_policy_hold || battmgr->charge_error ||
+	/*
+	 * Bypass charging keeps the 9 V contract and its input limit: with
+	 * charging off the charger still supplies the system, so the tablet
+	 * draws what it needs from the source rather than from the battery.
+	 */
+	bypass = READ_ONCE(battmgr->charge_bypass) && !battmgr->charge_error;
+	if ((!bypass && (battmgr->charge_inhibited || battmgr->charge_policy_hold ||
+			 vbat >= (battmgr->pd_restore ? PD_VBAT_STOP_UV : PD_VBAT_START_UV))) ||
+	    battmgr->charge_error ||
 	    (health != POWER_SUPPLY_HEALTH_GOOD && health != POWER_SUPPLY_HEALTH_COOL &&
-	     health != POWER_SUPPLY_HEALTH_WARM) ||
-	    vbat >= (battmgr->pd_restore ? PD_VBAT_STOP_UV : PD_VBAT_START_UV)) {
+	     health != POWER_SUPPLY_HEALTH_WARM)) {
 		qcom_battmgr_pd_stop(battmgr, false, "battery limit");
 		set_bit(PD_EVENT_CAPS, &battmgr->pd_events);
 		qcom_battmgr_pd_log(battmgr, type);
@@ -3152,11 +3180,44 @@ static int qcom_battmgr_bat_is_writeable(struct power_supply *psy,
 	case POWER_SUPPLY_PROP_CHARGE_CONTROL_START_THRESHOLD:
 	case POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD:
 		return 1;
+	case POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR:
+		return !!(battmgr->quirks & QCOM_BATTMGR_QUIRK_CHARGE_ENABLE);
 	default:
 		return 0;
 	}
 
 	return 0;
+}
+
+/*
+ * Bypass charging: with "inhibit-charge" the charge worker holds charging
+ * off, so a connected charger powers the system and the battery is neither
+ * charged nor, while the charger covers the load, discharged.  "auto" hands
+ * charging back to the thresholds.
+ */
+static int qcom_battmgr_set_charge_bypass(struct qcom_battmgr *battmgr, int behaviour)
+{
+	if (!(battmgr->quirks & QCOM_BATTMGR_QUIRK_CHARGE_ENABLE))
+		return -EOPNOTSUPP;
+
+	switch (behaviour) {
+	case POWER_SUPPLY_CHARGE_BEHAVIOUR_AUTO:
+		guard(mutex)(&battmgr->charge_lock);
+		if (battmgr->charge_bypass) {
+			WRITE_ONCE(battmgr->charge_bypass, false);
+			/* The thresholds decide again from the current charge */
+			battmgr->charge_policy_hold = false;
+			dev_info(battmgr->dev, "bypass charging off\n");
+		}
+		return 0;
+	case POWER_SUPPLY_CHARGE_BEHAVIOUR_INHIBIT_CHARGE:
+		WRITE_ONCE(battmgr->charge_bypass, true);
+		/* Renegotiate a contract that stopped once the battery was full */
+		set_bit(PD_EVENT_CAPS, &battmgr->pd_events);
+		return 0;
+	default:
+		return -EINVAL;
+	}
 }
 
 static int qcom_battmgr_bat_set_property(struct power_supply *psy,
@@ -3178,6 +3239,9 @@ static int qcom_battmgr_bat_set_property(struct power_supply *psy,
 		break;
 	case POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD:
 		ret = qcom_battmgr_set_charge_end_threshold(battmgr, pval->intval);
+		break;
+	case POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR:
+		ret = qcom_battmgr_set_charge_bypass(battmgr, pval->intval);
 		break;
 	default:
 		return -EINVAL;
@@ -3316,11 +3380,14 @@ static const enum power_supply_property sm8550_bat_props[] = {
 	POWER_SUPPLY_PROP_POWER_NOW,
 	POWER_SUPPLY_PROP_CHARGE_CONTROL_START_THRESHOLD,
 	POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD,
+	POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR,
 };
 
 static const struct power_supply_desc sm8550_bat_psy_desc = {
 	.name = "qcom-battmgr-bat",
 	.type = POWER_SUPPLY_TYPE_BATTERY,
+	.charge_behaviours = BIT(POWER_SUPPLY_CHARGE_BEHAVIOUR_AUTO) |
+			     BIT(POWER_SUPPLY_CHARGE_BEHAVIOUR_INHIBIT_CHARGE),
 	.properties = sm8550_bat_props,
 	.num_properties = ARRAY_SIZE(sm8550_bat_props),
 	.get_property = qcom_battmgr_bat_get_property,
@@ -4349,6 +4416,9 @@ static bool qcom_battmgr_bat_prop_hidden(struct qcom_battmgr *battmgr,
 	case POWER_SUPPLY_PROP_CHARGE_CONTROL_START_THRESHOLD:
 	case POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD:
 		return qcom_battmgr_no_charge_ctrl(battmgr);
+	/* Only the driver-enforced charge control can hold charging off */
+	case POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR:
+		return !(battmgr->quirks & QCOM_BATTMGR_QUIRK_CHARGE_ENABLE);
 	default:
 		return false;
 	}
