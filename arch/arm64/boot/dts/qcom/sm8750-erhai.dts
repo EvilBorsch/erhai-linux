@@ -344,13 +344,15 @@
 		};
 	};
 
-	pmic-glink {
+	pmic_glink: pmic-glink {
 		compatible = "oneplus,pad2pro-pmic-glink",
 			     "qcom,sm8750-pmic-glink",
 			     "qcom,sm8550-pmic-glink",
 			     "qcom,pmic-glink";
 		#address-cells = <1>;
 		#size-cells = <0>;
+		/* The battery temperature, for battery-thermal. */
+		#thermal-sensor-cells = <0>;
 
 		/* Stock oplus_spec,external_gauge_support. */
 		oplus,external-gauge = <&battery_gauge>;
@@ -1666,6 +1668,67 @@
 							 <&cpu5 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
 							 <&cpu6 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
 							 <&cpu7 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+
+		/*
+		 * The battery pack, as the charger firmware measures it. The
+		 * trips are OnePlus's battery protection for this tablet
+		 * (odm/etc/temperature_profile/
+		 * sys_high_temp_protect_OPPO_24976.xml of 16.0.10.600:
+		 * HighTemperatureProtectThresholdIn 490, ThresholdOut 470,
+		 * ShutDown 700), not its comfort table, which slows Android
+		 * down much earlier. From 49 C step_wise lowers the CPU and GPU
+		 * clock caps one step per poll while the pack still warms up,
+		 * gives a step back per poll while it cools above 47 C and
+		 * removes the caps once it cools below 47 C. The deepest caps
+		 * are the deepest stock level: 1152 MHz for CPUs 0-5 (state
+		 * 11), 1017.6 MHz for CPUs 6-7 (their lowest, state 15 with the
+		 * two boost levels) and 389 MHz for the GPU (state 10). At 70 C
+		 * the kernel powers the tablet off. The firmware raises no
+		 * alarm, so the zone is polled; the pack changes by well under
+		 * a degree in five seconds. A cooling device takes the deepest
+		 * state any zone asks for, so the junction zones above and
+		 * this zone never lift each other's caps.
+		 */
+		battery-thermal {
+			polling-delay-passive = <5000>;
+			polling-delay = <5000>;
+			critical-action = "shutdown";
+
+			thermal-sensors = <&pmic_glink>;
+
+			trips {
+				battery_alert: trip-point0 {
+					temperature = <49000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+
+				trip-point1 {
+					temperature = <70000>;
+					hysteresis = <0>;
+					type = "critical";
+				};
+			};
+
+			cooling-maps {
+				map0 {
+					trip = <&battery_alert>;
+					cooling-device = <&cpu0 0 11>,
+							 <&cpu1 0 11>,
+							 <&cpu2 0 11>,
+							 <&cpu3 0 11>,
+							 <&cpu4 0 11>,
+							 <&cpu5 0 11>,
+							 <&cpu6 0 THERMAL_NO_LIMIT>,
+							 <&cpu7 0 THERMAL_NO_LIMIT>;
+				};
+
+				map1 {
+					trip = <&battery_alert>;
+					cooling-device = <&gpu 0 10>;
 				};
 			};
 		};
