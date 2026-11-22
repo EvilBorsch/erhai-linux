@@ -1464,9 +1464,25 @@ static void a6xx_gmu_shutdown(struct a6xx_gmu *gmu)
 
 	ret = a6xx_gmu_wait_for_idle(gmu);
 
-	/* If the GMU isn't responding assume it is hung */
-	if (ret)
+	/*
+	 * If the GMU isn't responding assume it is hung. The wait spins for a
+	 * second with the GMU lock held, so say what it waited for: silent,
+	 * the only sign is a GPU that stalls every client for that second.
+	 */
+	if (ret) {
+		DRM_DEV_ERROR_RATELIMITED(gmu->dev,
+			"GMU did not reach idle level %d before slumber: power state %u, GX %s, pwr_clk_status 0x%x, cx_busy 0x%x, hw_init %s\n",
+			gmu->idle_level,
+			gmu_read(gmu, adreno_is_a8xx(adreno_gpu) ?
+				REG_A8XX_GPU_GMU_CX_GMU_RPMH_POWER_STATE :
+				REG_A6XX_GPU_GMU_CX_GMU_RPMH_POWER_STATE),
+			adreno_gpu->funcs->gx_is_on(adreno_gpu) ? "on" : "off",
+			adreno_is_a8xx(adreno_gpu) ?
+				gmu_read(gmu, REG_A8XX_GMU_PWR_CLK_STATUS) : 0,
+			gmu_read(gmu, REG_A6XX_GPU_GMU_AO_GPU_CX_BUSY_STATUS),
+			adreno_gpu->base.needs_hw_init ? "not done" : "done");
 		goto force_off;
+	}
 
 	adreno_gpu->funcs->bus_halt(adreno_gpu, a6xx_gpu->hung);
 
