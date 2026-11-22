@@ -24,6 +24,7 @@
 #include <linux/spinlock.h>
 #include <linux/math.h>
 #include <linux/suspend.h>
+#include <linux/thermal.h>
 #include <linux/units.h>
 #include <linux/usb/pd.h>
 #include <linux/usb/role.h>
@@ -526,6 +527,16 @@ struct qcom_battmgr {
 	 */
 	spinlock_t notify_lock;
 	bool removing;
+
+	/*
+	 * The battery temperature as a thermal sensor, in millidegrees: the
+	 * last reading passed to the zone and the last one read. Only the
+	 * zone's get_temp(), under the zone lock, uses these.
+	 */
+	int bat_tz_temp;
+	int bat_tz_last;
+	bool bat_tz_known;
+	bool bat_tz_failing;
 
 	/* Property id and value in the answer to the last accepted request */
 	u32 resp_property;
@@ -1445,6 +1456,89 @@ static int qcom_battmgr_bat_get_property(struct power_supply *psy,
 	}
 
 	return 0;
+}
+
+/*
+ * The battery temperature as the sensor of a device tree thermal zone
+ * (#thermal-sensor-cells on the pmic-glink node), so that the board can cap
+ * the CPU and GPU clocks for the battery's sake and power off when the pack
+ * gets too hot. The firmware raises no temperature alarm: the zone polls.
+ *
+ * A reading the zone cannot use is reported as THERMAL_TEMP_INVALID, on which
+ * the thermal core keeps polling and leaves the cooling as it is. An error
+ * would instead make it retry with a growing delay and, after two minutes of
+ * failures, disable the zone together with its critical trip. Readings are
+ * unavailable until the firmware service is up and while it restarts.
+ */
+#define BATTMGR_TZ_TEMP_MIN	(-40 * MILLIDEGREE_PER_DEGREE)
+#define BATTMGR_TZ_TEMP_MAX	(120 * MILLIDEGREE_PER_DEGREE)
+/* More than the pack's temperature can change between two polls. */
+#define BATTMGR_TZ_TEMP_STEP	(5 * MILLIDEGREE_PER_DEGREE)
+
+static int qcom_battmgr_bat_get_temp(struct thermal_zone_device *tz, int *temp)
+{
+	struct qcom_battmgr *battmgr = thermal_zone_device_priv(tz);
+	union power_supply_propval val;
+	int ret, mc, last;
+
+	*temp = THERMAL_TEMP_INVALID;
+
+	ret = power_supply_get_property(battmgr->bat_psy, POWER_SUPPLY_PROP_TEMP, &val);
+	if (ret) {
+		/* -EAGAIN: the firmware service is not up (yet). */
+		if (ret != -EAGAIN && !battmgr->bat_tz_failing)
+			dev_warn(battmgr->dev, "no battery temperature for the thermal zone: %d\n",
+				 ret);
+		battmgr->bat_tz_failing = ret != -EAGAIN;
+		return 0;
+	}
+
+	mc = val.intval * MILLIDEGREE_PER_DECIDEGREE;
+	if (mc < BATTMGR_TZ_TEMP_MIN || mc > BATTMGR_TZ_TEMP_MAX) {
+		if (!battmgr->bat_tz_failing)
+			dev_warn(battmgr->dev, "battery temperature out of range: %d mC\n", mc);
+		battmgr->bat_tz_failing = true;
+		return 0;
+	}
+	battmgr->bat_tz_failing = false;
+
+	/*
+	 * A step the pack cannot make between two readings is passed on only
+	 * when the next reading confirms it, so that one wrong reading neither
+	 * powers the system off nor moves the cooling.
+	 */
+	last = battmgr->bat_tz_last;
+	battmgr->bat_tz_last = mc;
+	if (battmgr->bat_tz_known &&
+	    abs(mc - battmgr->bat_tz_temp) > BATTMGR_TZ_TEMP_STEP &&
+	    abs(mc - last) > BATTMGR_TZ_TEMP_STEP)
+		return 0;
+
+	battmgr->bat_tz_known = true;
+	battmgr->bat_tz_temp = mc;
+	*temp = mc;
+
+	return 0;
+}
+
+static const struct thermal_zone_device_ops qcom_battmgr_bat_tz_ops = {
+	.get_temp = qcom_battmgr_bat_get_temp,
+};
+
+/*
+ * A device tree without a zone for the sensor is fine. A zone that fails to
+ * register is reported, but the battery and the charger stay usable.
+ */
+static void qcom_battmgr_register_thermal(struct qcom_battmgr *battmgr)
+{
+	struct thermal_zone_device *tz;
+
+	if (!IS_ENABLED(CONFIG_THERMAL_OF))
+		return;
+
+	tz = devm_thermal_of_zone_register(battmgr->dev, 0, battmgr, &qcom_battmgr_bat_tz_ops);
+	if (IS_ERR(tz) && PTR_ERR(tz) != -ENODEV)
+		dev_err(battmgr->dev, "battery thermal zone not registered: %pe\n", tz);
 }
 
 static int qcom_battmgr_set_charge_control(struct qcom_battmgr *battmgr,
@@ -5183,6 +5277,12 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
 	ret = qcom_battmgr_charging_init(battmgr);
 	if (ret)
 		return dev_err_probe(dev, ret, "cannot create charging interface\n");
+
+	/*
+	 * After the client release action, so that the zone stops reading
+	 * the battery before requests to the firmware are shut off.
+	 */
+	qcom_battmgr_register_thermal(battmgr);
 
 	if (battmgr->quirks & QCOM_BATTMGR_QUIRK_OPLUS_PD) {
 		ret = devm_device_init_wakeup(dev);
