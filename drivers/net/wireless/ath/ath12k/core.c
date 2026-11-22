@@ -32,6 +32,30 @@ EXPORT_SYMBOL(ath12k_debug_mask);
 
 bool ath12k_ftm_mode;
 module_param_named(ftm_mode, ath12k_ftm_mode, bool, 0444);
+
+/* Debugging aids for the dual MAC configuration, see ath12k_core_disable_sbs().
+ * The first three are read when the firmware starts (unbind and bind the
+ * device to apply them), the last one by every scan request.
+ */
+static int ath12k_sbs_override = -1;
+module_param_named(sbs_override, ath12k_sbs_override, int, 0644);
+MODULE_PARM_DESC(sbs_override,
+		 "Debug: MAC config -1 by the board table, 0 never sent, 1 always sent");
+
+static unsigned int ath12k_mac_fw_mode_clear = WMI_DBS_FW_MODE_CFG_ASYNC_SBS;
+module_param_named(mac_fw_mode_clear, ath12k_mac_fw_mode_clear, uint, 0644);
+MODULE_PARM_DESC(mac_fw_mode_clear,
+		 "Debug: bits to clear in the firmware mode config");
+
+static unsigned int ath12k_mac_scan_clear;
+module_param_named(mac_scan_clear, ath12k_mac_scan_clear, uint, 0644);
+MODULE_PARM_DESC(mac_scan_clear,
+		 "Debug: bits to clear in the concurrent scan config");
+
+unsigned int ath12k_scan_dbs_policy;
+module_param_named(scan_dbs_policy, ath12k_scan_dbs_policy, uint, 0644);
+MODULE_PARM_DESC(scan_dbs_policy,
+		 "Debug: DBS policy of scan requests, 0 firmware default, 1 force non-DBS, 2 ignore duty cycle");
 MODULE_PARM_DESC(ftm_mode, "Boots up in factory test mode");
 EXPORT_SYMBOL(ath12k_ftm_mode);
 
@@ -142,13 +166,18 @@ static void ath12k_core_disable_sbs(struct ath12k_base *ab)
 	u32 fw_mode_config = wmi_ab->default_fw_config_bits;
 	int ret;
 
-	if (!ath12k_core_sbs_is_unsupported(ab))
+	if (!ath12k_sbs_override ||
+	    (ath12k_sbs_override < 0 && !ath12k_core_sbs_is_unsupported(ab))) {
+		ath12k_info(ab, "MAC config left alone: fw mode config 0x%08x, scan config 0x%08x\n",
+			    fw_mode_config, scan_config);
 		return;
+	}
 
 	/* Do not pair the two 5 GHz parts as simultaneous MLO links either. */
 	wmi_ab->hw_mode_info.support_sbs = false;
 
-	fw_mode_config &= ~WMI_DBS_FW_MODE_CFG_ASYNC_SBS;
+	fw_mode_config &= ~ath12k_mac_fw_mode_clear;
+	scan_config &= ~ath12k_mac_scan_clear;
 
 	ath12k_info(ab, "no SBS on this board: fw mode config 0x%08x -> 0x%08x, scan config 0x%08x\n",
 		    wmi_ab->default_fw_config_bits, fw_mode_config, scan_config);

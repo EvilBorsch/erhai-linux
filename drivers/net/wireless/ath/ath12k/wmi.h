@@ -3564,6 +3564,11 @@ struct  wmi_start_scan_cmd {
 
 #define WMI_SCAN_DWELL_MODE_MASK GENMASK(23, 21)
 
+/* scan_ctrl_flags_ext: DBS scan policy, 0 firmware default, 1 force non-DBS,
+ * 2 ignore duty cycle
+ */
+#define WMI_SCAN_FLAG_EXT_DBS_SCAN_POLICY_MASK GENMASK(1, 0)
+
 enum {
 	WMI_SCAN_DWELL_MODE_DEFAULT      = 0,
 	WMI_SCAN_DWELL_MODE_CONSERVATIVE = 1,

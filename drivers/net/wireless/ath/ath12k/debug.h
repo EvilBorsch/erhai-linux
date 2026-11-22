@@ -70,6 +70,8 @@ do {								\
 		__ath12k_dbg(ab, mask, fmt, ##__VA_ARGS__);	\
 } while (0)
 
+extern unsigned int ath12k_scan_dbs_policy;
+
 #define ath12k_generic_dbg(dbg_mask, fmt, ...)			\
 	ath12k_dbg(NULL, dbg_mask, fmt, ##__VA_ARGS__)
 

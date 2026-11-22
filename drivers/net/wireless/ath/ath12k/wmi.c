@@ -2728,6 +2728,22 @@ int ath12k_wmi_send_scan_start_cmd(struct ath12k *ar,
 	cmd->num_ssids = cpu_to_le32(arg->num_ssids);
 	cmd->ie_len = cpu_to_le32(arg->extraie.len);
 	cmd->n_probes = cpu_to_le32(arg->n_probes);
+	cmd->scan_ctrl_flags_ext =
+		le32_encode_bits(ath12k_scan_dbs_policy,
+				 WMI_SCAN_FLAG_EXT_DBS_SCAN_POLICY_MASK);
+
+	ath12k_dbg(ar->ab, ATH12K_DBG_WMI,
+		   "wmi start scan vdev %u flags 0x%x ext 0x%x prio %u dwell active %u 2g %u 6g %u passive %u 6g %u probe delay %u chans %u (%u..%u) ssids %u bssids %u ie len %u 11d state %d\n",
+		   arg->vdev_id, le32_to_cpu(cmd->scan_ctrl_flags),
+		   le32_to_cpu(cmd->scan_ctrl_flags_ext),
+		   le32_to_cpu(cmd->scan_priority), arg->dwell_time_active,
+		   arg->dwell_time_active_2g, arg->dwell_time_active_6g,
+		   arg->dwell_time_passive, arg->dwell_time_passive_6g,
+		   arg->probe_delay, arg->num_chan,
+		   arg->num_chan ? arg->chan_list[0] : 0,
+		   arg->num_chan ? arg->chan_list[arg->num_chan - 1] : 0,
+		   arg->num_ssids, arg->num_bssid, arg->extraie.len,
+		   ar->state_11d);
 
 	ptr += sizeof(*cmd);
 
