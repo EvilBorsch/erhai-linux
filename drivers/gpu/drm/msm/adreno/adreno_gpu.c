@@ -402,14 +402,33 @@ int adreno_get_param(struct msm_gpu *gpu, struct msm_context *ctx,
 			if (READ_ONCE(gpu->wedged))
 				return -EIO;
 
-			ret = pm_runtime_resume_and_get(&gpu->pdev->dev);
-			if (ret < 0)
-				return ret;
+			/*
+			 * Bring the GPU up the way a submit does, hw_init
+			 * included. A GPU that is only resumed cannot be put
+			 * back to sleep cleanly: with IFPC, the GMU of an
+			 * A830 never reaches its idle level in that state, and
+			 * the suspend that follows busy-waits a second with
+			 * the GMU lock held before forcing the GMU off. Every
+			 * GL or Vulkan client asks for the timestamp when it
+			 * opens the device, so that happened whenever one
+			 * started while the GPU was asleep.
+			 */
+			mutex_lock(&gpu->lock);
 
-			*value = adreno_gpu->funcs->get_timestamp(gpu);
+			ret = pm_runtime_resume_and_get(&gpu->pdev->dev);
+			if (ret < 0) {
+				mutex_unlock(&gpu->lock);
+				return ret;
+			}
+
+			ret = msm_gpu_hw_init(gpu);
+			if (!ret)
+				*value = adreno_gpu->funcs->get_timestamp(gpu);
 			pm_runtime_put_autosuspend(&gpu->pdev->dev);
 
-			return 0;
+			mutex_unlock(&gpu->lock);
+
+			return ret;
 		}
 		return -EINVAL;
 	case MSM_PARAM_PRIORITIES:
