@@ -103,6 +103,61 @@ static bool ath12k_core_rfkill_is_broken(struct ath12k_base *ab)
 	return false;
 }
 
+/*
+ * Boards whose RF front end cannot run the two MACs of the chip on the lower
+ * and the upper part of the 5 GHz band at the same time (SBS). Left alone,
+ * the firmware does that while no vdev is up: it scans the two parts in
+ * parallel, and on these boards the MAC that gets the lower part (channels
+ * 36-64) receives nothing as soon as the request also has a channel of the
+ * upper part (132 and up), so a scan never finds the BSSes there. The vendor
+ * driver keeps "async SBS" out of the firmware mode configuration on these
+ * boards (enable_sbs=0 in its configuration file). Ideally this would be a
+ * property of the board DT.
+ */
+static const struct ath12k_core_no_sbs_table {
+	enum ath12k_hw_rev hw_rev;
+	const char *compatible;
+} ath12k_core_no_sbs_table[] = {
+	{ ATH12K_HW_WCN7860_HW20, "oneplus,erhai" },
+	{ /* Sentinel */ }
+};
+
+static bool ath12k_core_sbs_is_unsupported(struct ath12k_base *ab)
+{
+	const struct ath12k_core_no_sbs_table *entry;
+
+	for (entry = ath12k_core_no_sbs_table; entry->compatible; entry++) {
+		if (ab->hw_rev == entry->hw_rev &&
+		    of_machine_is_compatible(entry->compatible))
+			return true;
+	}
+
+	return false;
+}
+
+static void ath12k_core_disable_sbs(struct ath12k_base *ab)
+{
+	struct ath12k_wmi_base *wmi_ab = &ab->wmi_ab;
+	u32 scan_config = wmi_ab->default_conc_scan_config_bits;
+	u32 fw_mode_config = wmi_ab->default_fw_config_bits;
+	int ret;
+
+	if (!ath12k_core_sbs_is_unsupported(ab))
+		return;
+
+	/* Do not pair the two 5 GHz parts as simultaneous MLO links either. */
+	wmi_ab->hw_mode_info.support_sbs = false;
+
+	fw_mode_config &= ~WMI_DBS_FW_MODE_CFG_ASYNC_SBS;
+
+	ath12k_info(ab, "no SBS on this board: fw mode config 0x%08x -> 0x%08x, scan config 0x%08x\n",
+		    wmi_ab->default_fw_config_bits, fw_mode_config, scan_config);
+
+	ret = ath12k_wmi_pdev_set_mac_config(ab, scan_config, fw_mode_config);
+	if (ret)
+		ath12k_warn(ab, "failed to disable SBS in the firmware: %d\n", ret);
+}
+
 static int ath12k_core_rfkill_config(struct ath12k_base *ab)
 {
 	struct ath12k *ar;
@@ -1005,6 +1060,8 @@ static int ath12k_core_start(struct ath12k_base *ab)
 			goto err_reo_cleanup;
 		}
 	}
+
+	ath12k_core_disable_sbs(ab);
 
 	ret = ath12k_dp_tx_htt_h2t_ver_req_msg(ab);
 	if (ret) {
