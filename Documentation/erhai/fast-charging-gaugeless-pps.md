@@ -1,7 +1,8 @@
 # PD PPS fast charging on the OnePlus Pad 3 without the pack gauge (gauge-id 1)
 
-Branch `eb/fast-charging`. Written 2026-11-23. **Not yet run on a tablet**: the code is built, the feature is off
-by default, and the test plan at the end is what has to happen before anything here counts as working. Background:
+Branch `eb/fast-charging`. Written 2026-11-23. **Partly tested on the tablet**: steps 0-2 and one fault drill
+passed on 2026-11-23 (see "Results on this tablet"); steps 3-5 and the other drills need the battery lower. The
+feature is off by default until the whole test plan has passed. Background:
 `fast-charging-no-gauge.md` (what the variant is, why fast charging was parked) and `bypass-charging.md` on branch
 `eb/bypass-charging` (the firmware protocol).
 
@@ -127,8 +128,8 @@ After each step save `dmesg` and the samples to `device-logs/` and note the resu
 
 ## Open risks
 
-- Nothing in this branch has run on a tablet. The engine's PPS and pump sequences were validated by the port's
-  author on the variant with the gauge; the ADSP firmware of this unit may answer the PPS properties differently.
+- Up to 2 A from the charger (about 3.4 A into the pack) has run on this tablet, 5 A has not. The engine's PPS and
+  pump sequences were validated by the port's author on the variant with the gauge; the ADSP firmware of this unit may answer the PPS properties differently.
 - The pack is not authenticated; the battery profile name is a consistency check, not proof.
 - The SC8547A battery ADC and its battery overvoltage threshold (`REG_00 = 0x20 | ovp`, device tree default) have
   not been read on this unit; step 1 shows whether the pump's cell voltage agrees with the firmware's.
@@ -140,3 +141,31 @@ After each step save `dmesg` and the samples to `device-logs/` and note the resu
   would need the bound revisited.
 - With a 3 A cable or charger the gain over today's 18 W is small until the pump engages (bus 3 A at about 9 V,
   27 W).
+
+## Results on this tablet
+
+Kernel `eb9` (`eb/integration` 5d94aa18c), firmware 16.0.10.600, a PD PPS wall charger and its own cable, the
+tablet in use with the screen on (system draw about 0.8-1 A). Samples once a second by `tools/tab/fastchg-step.sh`
+and `tools/tab/fastchg-drill.sh` of the workspace, logs `device-logs/fastchg-*.txt`.
+
+| Step | Date, state | Result |
+|---|---|---|
+| 0 | 2026-11-23, 82 %, 28 °C | as `eb7`: `state=idle`, fixed 9 V, input 1.98 A, pack 2.0-2.9 A. The UCSI driver lists no partner capabilities on this unit, so the charger's PPS ranges were not read; the engine reads them itself (contract accepted in steps 1-2). Passed. |
+| 1 | 1000 mA, 3 min, 82-83 %, 27-29 °C | PPS contract after 0.2 s, CP entry, `CP 2:1 ENGAGED` (chip vbus 9135 mV, vbat 4342 mV), then `taper` (cell curve) for the whole step: pack 1.08 A on average, 1.28 A at most, cell at most 4383 mV, no `readings disagree`. Parameter 0: back to idle in 0.5 s, the fixed 9 V contract within 2 s (pack 2.9 A). Passed. |
+| 2 | 2000 mA, 5 min, 83-85 %, 27-29 °C | engaged after 6 s, `taper`, PPS set 9.67 V: pack 2.98 A on average, 3.43 A at most (fixed 9 V gives 2.88 A on the same tablet at the same moment), cell at most 4483 mV, battery at most 29 °C, no warnings. Fallback as in step 1. Passed. |
+| 6 | parameter 0 mid-session, 86 % | request 1500 mA (the table's 85-90 % row), pump bus 1434 mA, pack 2.06 A; parameter 0 → pump off and `state=idle` within one sample (under 1 s), pack back to 2.7 A from the fixed 9 V contract after 1 s. Passed. |
+| 6 | `inhibit-charge` mid-session, 87 % | not run: no session started. The fixed 9 V charge had already taken the cell to 4.50 V, above the table's 4.49 V end, so the engine stayed idle (correct). |
+
+Observations:
+
+- While the pump runs, `qcom-battmgr-usb` `current_now` reads 0: the firmware does not measure the bus with the buck
+  suspended. The bus current is `pump_ibus_ma` in `charge_contract` (from the master pump's ADC).
+- Above 85 % the stock table allows 1.5 A from the charger; the pumps then put about 2.1 A into the pack, less than
+  the fixed 9 V contract gives (2.8 A). The stock system behaves the same (it suspends the buck as well).
+- The firmware's own fixed 9 V charging holds the cell at 4.49-4.51 V from about 86 %; the end of a PPS session at
+  4.49 V is therefore normal, not a fault.
+- The engine logs one `taper vbus ...` line every 0.5 s while it runs (7200 lines an hour). That has to be rate
+  limited before the feature can be on by default.
+- Still to do: drills `inhibit-charge`, suspend, cable pull and replug (battery under 80 %); steps 3-5 (battery
+  20-50 %; steps 4-5 need a charger with a 5 A PPS range and a 5 A cable).
+
