@@ -803,14 +803,18 @@ static int qcom_battmgr_firmware_property(struct qcom_battmgr *battmgr, int opco
 /*
  * Fast charging on a board without the pack gauge. The stock system charges
  * such a board through the pumps as well, from the firmware's battery
- * readings; here it is opt-in and PD PPS only, see erhai_pps.c. 0 keeps the
- * pumps parked: the firmware charges by itself from 5 V or a fixed 9 V
- * contract. Any other value lets PPS in and is the ceiling of the current
- * taken from the charger in mA (the pumps put about twice that into the
- * pack); the stock ceiling is 5000. Read on every pass of the charge worker,
- * so it can be lowered, or cleared to stop, while a charger is connected.
+ * readings; here it is PD PPS only, see erhai_pps.c. 0 keeps the pumps
+ * parked: the firmware charges by itself from 5 V or a fixed 9 V contract.
+ * Any other value lets PPS in and is the ceiling of the current taken from
+ * the charger in mA (the pumps put about twice that into the pack); the
+ * stock ceiling is 5000. Read on every pass of the charge worker, so it can
+ * be lowered, or cleared to stop, while a charger is connected.
+ *
+ * On by default at 3000 since the test plan's steps 0-3 and fault drills
+ * passed on the tablet (Documentation/erhai/fast-charging-gaugeless-pps.md);
+ * the stock 5000 waits for a test with a 5 A PPS charger and cable.
  */
-static unsigned int gaugeless_pps_ma;
+static unsigned int gaugeless_pps_ma = 3000;
 module_param(gaugeless_pps_ma, uint, 0644);
 MODULE_PARM_DESC(gaugeless_pps_ma,
 		 "without the pack gauge: PD PPS fast charging up to this bus current in mA (0 = off, stock 5000)");

@@ -1,8 +1,8 @@
 # PD PPS fast charging on the OnePlus Pad 3 without the pack gauge (gauge-id 1)
 
-Branch `eb/fast-charging`. Written 2026-11-23. **Partly tested on the tablet**: steps 0-2 and one fault drill
-passed on 2026-11-23 (see "Results on this tablet"); steps 3-5 and the other drills need the battery lower. The
-feature is off by default until the whole test plan has passed. Background:
+Branch `eb/fast-charging`. Written 2026-11-23. **On by default at 3000 mA** (branch `eb/fast-charging-on`): steps 0-3
+and all fault drills passed on the tablet on 2026-11-23 (see "Results on this tablet"). Steps 4-5 at the stock 5000 mA
+need a charger with a 5 A PPS range and a 5 A cable, which the owner does not have yet. Background:
 `fast-charging-no-gauge.md` (what the variant is, why fast charging was parked) and `bypass-charging.md` on branch
 `eb/bypass-charging` (the firmware protocol).
 
@@ -155,6 +155,10 @@ and `tools/tab/fastchg-drill.sh` of the workspace, logs `device-logs/fastchg-*.t
 | 2 | 2000 mA, 5 min, 83-85 %, 27-29 °C | engaged after 6 s, `taper`, PPS set 9.67 V: pack 2.98 A on average, 3.43 A at most (fixed 9 V gives 2.88 A on the same tablet at the same moment), cell at most 4483 mV, battery at most 29 °C, no warnings. Fallback as in step 1. Passed. |
 | 6 | parameter 0 mid-session, 86 % | request 1500 mA (the table's 85-90 % row), pump bus 1434 mA, pack 2.06 A; parameter 0 → pump off and `state=idle` within one sample (under 1 s), pack back to 2.7 A from the fixed 9 V contract after 1 s. Passed. |
 | 6 | `inhibit-charge` mid-session, 87 % | not run: no session started. The fixed 9 V charge had already taken the cell to 4.50 V, above the table's 4.49 V end, so the engine stayed idle (correct). |
+| 6 | `inhibit-charge` mid-session, 57 %, kernel tp3 | pump off within 0.9 s, charging off (battery -1..-4 mA, the charger feeds the system, 0.25-0.5 A); `auto` again: fixed 9 V within 8 s, a new PPS session engaged 10 s later (bus 2.0 A, pack 3.2 A). Passed. |
+| 6 | suspend mid-session, 58 % | not reachable: with a wall charger online the battery manager holds its charge wakeup source (`erhai_should_stay_awake()`) and `qcom_battmgr_prepare_sleep()` vetoes suspend, so `systemctl suspend` failed with EPERM after 30 ms and the session went on under the AP's supervision. Safe; the PM notifier's PPS stop only matters for a source that does not keep the AP awake. |
+| 6 | cable pulled and replugged mid-session, 59 % | pump off 93 ms after the pull (battery -0.85 A); replug: fixed 9 V after 6 s (pack 2.9 A), a new PPS session engaged 20 s later (bus 2.0 A, pack 3.1 A). Passed. |
+| 3 | 3000 mA, 10 min, 59-65 %, 30-31 C | the engine asked the charger for 2500 mA (this charger's PPS range or the table's 55-75 % row), pack 4.02 A on average and 4.33 A at most against 2.9 A from fixed 9 V (about 40 % faster), +6 % in 10 min, battery +1 C, no warnings; parameter 0: fixed 9 V again within 2 s. Passed. |
 
 Observations:
 
@@ -166,6 +170,6 @@ Observations:
   4.49 V is therefore normal, not a fault.
 - The engine logs its `charging`/`taper vbus ...` line on the first 60 polls of a session only (`pps_log_ticks`,
   30 s), then stays quiet until the session ends: in step 2 the lines stop 33 s after the pump engaged.
-- Still to do: drills `inhibit-charge`, suspend, cable pull and replug (battery under 80 %); steps 3-5 (battery
-  20-50 %; steps 4-5 need a charger with a 5 A PPS range and a 5 A cable).
+- Still to do: steps 4-5 at 5000 mA (a charger with a 5 A PPS range and a 5 A cable); until then the default is
+  3000 mA.
 
