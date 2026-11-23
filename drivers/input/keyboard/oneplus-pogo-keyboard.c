@@ -143,10 +143,11 @@
  * apart).  Reported as a lift and a new touch, the short piece in between
  * reads as a tap, and libinput turns the next touch into tap-and-drag: a
  * held button nobody pressed.  A contact that comes back within the
- * debounce time and this distance is the same touch.
+ * debounce time and this distance is the same touch.  Replayed on those
+ * recordings, 25 ms and 15 mm glue all 6 touches back and nothing else.
  */
+#define POGO_KB_TP_LIFT_DEBOUNCE_MS	25
 #define POGO_KB_TP_LIFT_DIST_MM		15
-#define POGO_KB_TP_FW_GESTURES		0x17
 
 #define POGO_KB_VENDOR			0x22d9
 #define POGO_KB_PRODUCT			0x3869
@@ -174,36 +175,6 @@ static const struct pogo_kb_model pogo_kb_models[] = {
 static const struct pogo_kb_model pogo_kb_model_unknown = {
 	"Pogo Pin Keyboard", "Pogo Pin Keyboard Touchpad"
 };
-
-/*
- * Touchpad experiments of the erhai test kernel.  All of them can be changed
- * at run time in /sys/module/oneplus_pogo_keyboard/parameters/, so each one
- * can be measured against the previous behaviour.  Only tp_scan_time is on
- * by default (measured, see pogo_kb_tp_time()).
- */
-static bool tp_trace;
-module_param(tp_trace, bool, 0644);
-MODULE_PARM_DESC(tp_trace, "Log every raw touchpad frame");
-
-static bool tp_scan_time = true;
-module_param(tp_scan_time, bool, 0644);
-MODULE_PARM_DESC(tp_scan_time, "Timestamp touchpad frames by the touch controller's scan counter");
-
-static bool tp_palm;
-module_param(tp_palm, bool, 0644);
-MODULE_PARM_DESC(tp_palm, "Report contacts without the confidence bit as palms");
-
-static int tp_fw_gestures = -1;
-module_param(tp_fw_gestures, int, 0644);
-MODULE_PARM_DESC(tp_fw_gestures, "Firmware touchpad gestures, set on attach: 0 off, 1 on, -1 untouched");
-
-static bool tp_drop_touchdown_click;
-module_param(tp_drop_touchdown_click, bool, 0644);
-MODULE_PARM_DESC(tp_drop_touchdown_click, "Ignore a button press that arrives together with a new contact");
-
-static unsigned int tp_lift_debounce_ms = 25;
-module_param(tp_lift_debounce_ms, uint, 0644);
-MODULE_PARM_DESC(tp_lift_debounce_ms, "Report a lifted contact only once it stays away this long (0: at once)");
 
 static const unsigned char pogo_kb_hid_keys[256] = {
 	  0,   0,   0,   0,  30,  48,  46,  32,  18,  33,  34,  35,  23,  36,  37,  38,
@@ -334,7 +305,7 @@ struct pogo_kb {
 	bool touching;
 	bool caps_on;
 
-	/* Touchpad clock and button state */
+	/* Touchpad clock */
 	bool tp_clock_valid;
 	u16 tp_scan;
 	u64 tp_frame_ns;
@@ -342,8 +313,6 @@ struct pogo_kb {
 	ktime_t tp_offset;
 	ktime_t tp_last_rx;
 	u32 tp_msc;
-	bool tp_button;
-	bool tp_button_dropped;
 	/* Lifts held back for the debounce time, and where each contact was */
 	unsigned long tp_lift_pending;
 	ktime_t tp_lift_time[POGO_KB_TP_SLOTS];	/* arrival, for the debounce */
@@ -566,19 +535,18 @@ static void pogo_kb_tp_end_slots(struct pogo_kb *kb, unsigned long slots)
 	kb->touching = touching;
 
 	input_mt_sync_frame(input);
-	input_report_key(input, BTN_LEFT, kb->tp_button && !kb->tp_button_dropped);
 	input_sync(input);
 }
 
 /* Held-back lifts whose debounce time is over at @now. */
 static unsigned long pogo_kb_tp_lifts_due(struct pogo_kb *kb, ktime_t now)
 {
-	unsigned int ms = READ_ONCE(tp_lift_debounce_ms);
 	unsigned long due = 0;
 	unsigned int i;
 
 	for_each_set_bit(i, &kb->tp_lift_pending, POGO_KB_TP_SLOTS)
-		if (ktime_ms_delta(now, kb->tp_lift_time[i]) >= ms)
+		if (ktime_ms_delta(now, kb->tp_lift_time[i]) >=
+		    POGO_KB_TP_LIFT_DEBOUNCE_MS)
 			__set_bit(i, &due);
 
 	return due;
@@ -611,8 +579,8 @@ static void pogo_kb_report_touchpad(struct pogo_kb *kb, const u8 *data, u8 len)
 {
 	struct input_dev *input = kb->tp;
 	ktime_t now = ktime_get();
-	unsigned int count, i, debounce = READ_ONCE(tp_lift_debounce_ms);
-	bool touching = false, new_contact = false, button;
+	unsigned int count, i;
+	bool touching = false;
 	unsigned long end;
 	ktime_t ts;
 
@@ -650,19 +618,15 @@ static void pogo_kb_report_touchpad(struct pogo_kb *kb, const u8 *data, u8 len)
 	if (end)
 		pogo_kb_tp_end_slots(kb, end);
 
+	/* Debug log of every raw frame: arrival and scan time in us, the bytes */
 	ts = now;
 	if (count * POGO_KB_TP_SLOT_LEN + POGO_KB_TP_TRAILER_LEN <= len) {
-		ktime_t t = pogo_kb_tp_time(kb, get_unaligned_le16(&data[len - 4]), now);
-
-		if (READ_ONCE(tp_scan_time)) {
-			ts = t;
-			input_event(input, EV_MSC, MSC_TIMESTAMP, kb->tp_msc);
-		}
-		if (READ_ONCE(tp_trace))
-			dev_info(kb->dev, "tp %lld %lld %*ph\n", ktime_to_us(now),
-				 ktime_to_us(t), len, data);
-	} else if (READ_ONCE(tp_trace)) {
-		dev_info(kb->dev, "tp %lld - %*ph\n", ktime_to_us(now), len, data);
+		ts = pogo_kb_tp_time(kb, get_unaligned_le16(&data[len - 4]), now);
+		input_event(input, EV_MSC, MSC_TIMESTAMP, kb->tp_msc);
+		dev_dbg(kb->dev, "tp %lld %lld %*ph\n", ktime_to_us(now),
+			ktime_to_us(ts), len, data);
+	} else {
+		dev_dbg(kb->dev, "tp %lld - %*ph\n", ktime_to_us(now), len, data);
 	}
 	/* Event time never goes back, also around held-back lifts */
 	if (ktime_before(ts, kb->tp_last_ts))
@@ -674,22 +638,18 @@ static void pogo_kb_report_touchpad(struct pogo_kb *kb, const u8 *data, u8 len)
 		const u8 *slot = &data[i * POGO_KB_TP_SLOT_LEN];
 		unsigned int id = slot[0] >> 4;
 		bool down = slot[0] & BIT(1);
-		bool palm = down && !(slot[0] & BIT(0)) && READ_ONCE(tp_palm);
 
 		if (id >= POGO_KB_TP_SLOTS)
 			continue;
 
-		if (down && !input_mt_is_active(&input->mt->slots[id]))
-			new_contact = true;
-
-		if (!down && debounce && input_mt_is_active(&input->mt->slots[id])) {
+		if (!down && input_mt_is_active(&input->mt->slots[id])) {
 			/* Not yet: it may be back in a scan or two */
 			if (!test_and_set_bit(id, &kb->tp_lift_pending)) {
 				kb->tp_lift_time[id] = now;
 				kb->tp_lift_ts[id] = ts;
 			}
 			mod_delayed_work(system_highpri_wq, &kb->tp_lift_work,
-					 msecs_to_jiffies(debounce) + 1);
+					 msecs_to_jiffies(POGO_KB_TP_LIFT_DEBOUNCE_MS) + 1);
 			continue;
 		}
 		if (down) {
@@ -697,9 +657,12 @@ static void pogo_kb_report_touchpad(struct pogo_kb *kb, const u8 *data, u8 len)
 			kb->tp_last_y[id] = get_unaligned_le16(&slot[3]);
 		}
 
+		/*
+		 * Every contact is a finger: in the owner's recordings the touch
+		 * controller never cleared its confidence bit on a contact.
+		 */
 		input_mt_slot(input, id);
-		if (input_mt_report_slot_state(input, palm ? MT_TOOL_PALM : MT_TOOL_FINGER,
-					       down)) {
+		if (input_mt_report_slot_state(input, MT_TOOL_FINGER, down)) {
 			input_report_abs(input, ABS_MT_POSITION_X,
 					 get_unaligned_le16(&slot[1]));
 			input_report_abs(input, ABS_MT_POSITION_Y,
@@ -711,17 +674,9 @@ static void pogo_kb_report_touchpad(struct pogo_kb *kb, const u8 *data, u8 len)
 		touching |= input_mt_is_active(&input->mt->slots[i]);
 	kb->touching = touching;
 
-	/* A clickpad: either physical button is the one button */
-	button = data[len - 1] & (BIT(0) | BIT(1));
-	if (button && !kb->tp_button && new_contact &&
-	    READ_ONCE(tp_drop_touchdown_click))
-		kb->tp_button_dropped = true;
-	if (!button)
-		kb->tp_button_dropped = false;
-	kb->tp_button = button;
-
 	input_mt_sync_frame(input);
-	input_report_key(input, BTN_LEFT, button && !kb->tp_button_dropped);
+	/* A clickpad: either physical button is the one button */
+	input_report_key(input, BTN_LEFT, data[len - 1] & (BIT(0) | BIT(1)));
 	input_sync(input);
 }
 
@@ -745,8 +700,6 @@ static void pogo_kb_release_touches(struct pogo_kb *kb)
 	input_sync(input);
 	kb->touching = false;
 	kb->tp_lift_pending = 0;
-	kb->tp_button = false;
-	kb->tp_button_dropped = false;
 }
 
 static void pogo_kb_release_all(struct pogo_kb *kb)
@@ -1014,34 +967,6 @@ static int pogo_kb_set_awake(struct pogo_kb *kb, bool awake)
 	return 0;
 }
 
-/*
- * With its own gestures on, the keyboard holds touchpad reports back for up
- * to 200 ms after a touch begins and turns a two finger tap into a right
- * click of its own.  The desktop recognises gestures itself (libinput), so
- * it needs every report as it comes.  The stock driver exposes the same
- * command as /proc/pogopin/kbd_touch_gesture.
- */
-static void pogo_kb_set_fw_gestures(struct pogo_kb *kb)
-{
-	int mode = READ_ONCE(tp_fw_gestures);
-	u8 data[] = { POGO_KB_TP_FW_GESTURES, 0x01, mode > 0 };
-	int ret;
-
-	if (mode < 0)
-		return;
-
-	ret = pogo_kb_xfer(kb, POGO_KB_CMD_GENERAL, data, sizeof(data), true);
-	/* POGO_KB_TP_FW_GESTURES, 0x01, 1 for done */
-	if (!ret && (kb->reply_len < 3 || kb->reply[2] != 1))
-		ret = -EPROTO;
-	if (ret)
-		dev_warn(kb->dev, "keyboard did not confirm touchpad gestures %s: %d\n",
-			 mode > 0 ? "on" : "off", ret);
-	else
-		dev_info(kb->dev, "touchpad gestures of the keyboard %s\n",
-			 mode > 0 ? "on" : "off");
-}
-
 static void pogo_kb_log_version(struct pogo_kb *kb)
 {
 	static const u8 data[] = { POGO_KB_PASSTHROUGH_VERSION, 0x01, 0x01 };
@@ -1133,8 +1058,6 @@ static int pogo_kb_register_inputs(struct pogo_kb *kb, u8 brand)
 	input_set_capability(tp, EV_KEY, BTN_LEFT);
 	kb->tp_clock_valid = false;
 	kb->tp_period_ns = POGO_KB_TP_PERIOD_NS;
-	kb->tp_button = false;
-	kb->tp_button_dropped = false;
 	__set_bit(INPUT_PROP_BUTTONPAD, tp->propbit);
 
 	ret = input_mt_init_slots(tp, POGO_KB_TP_SLOTS, INPUT_MT_POINTER);
@@ -1412,8 +1335,6 @@ wake:
 	ret = pogo_kb_set_awake(kb, true);
 	if (ret)
 		dev_warn(kb->dev, "keyboard did not confirm wake-up: %d\n", ret);
-	else
-		pogo_kb_set_fw_gestures(kb);
 out:
 	mutex_unlock(&kb->lock);
 }
