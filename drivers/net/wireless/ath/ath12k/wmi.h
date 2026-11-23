@@ -2549,6 +2549,23 @@ struct ath12k_wmi_pdev_set_hw_mode_cmd {
 	__le32 num_band_to_mac;
 } __packed;
 
+/* Bits of fw_mode_config_bits in WMI_PDEV_SET_MAC_CONFIG_CMDID and of
+ * default_fw_config_bits in the service ready ext event.
+ */
+#define WMI_DBS_FW_MODE_CFG_ASYNC_SBS	BIT(26)
+
+struct wmi_pdev_set_mac_config_cmd {
+	__le32 tlv_header;
+	__le32 pdev_id;
+	__le32 concurrent_scan_config_bits;
+	__le32 fw_mode_config_bits;
+} __packed;
+
+struct wmi_pdev_set_mac_config_resp_event {
+	__le32 pdev_id;
+	__le32 status;
+} __packed;
+
 struct ath12k_wmi_ppe_threshold_params {
 	__le32 numss_m1; /** NSS - 1*/
 	__le32 ru_info;
@@ -5405,6 +5422,8 @@ struct ath12k_wmi_base {
 
 	struct completion service_ready;
 	struct completion unified_ready;
+	struct completion mac_config_done;
+	u32 mac_config_status;
 	DECLARE_BITMAP(svc_map, WMI_MAX_EXT2_SERVICE);
 	wait_queue_head_t tx_credits_wq;
 	u32 num_mem_chunks;
@@ -5416,6 +5435,8 @@ struct ath12k_wmi_base {
 	struct ath12k_wmi_target_cap_arg *targ_cap;
 
 	struct ath12k_svc_ext_info svc_ext_info;
+	u32 default_conc_scan_config_bits;
+	u32 default_fw_config_bits;
 	u32 sbs_lower_band_end_freq;
 	struct ath12k_hw_mode_info hw_mode_info;
 
@@ -6663,6 +6684,8 @@ int ath12k_wmi_probe_resp_tmpl(struct ath12k *ar, u32 vdev_id,
 			       struct sk_buff *tmpl);
 int ath12k_wmi_set_hw_mode(struct ath12k_base *ab,
 			   enum wmi_host_hw_mode_config_type mode);
+int ath12k_wmi_pdev_set_mac_config(struct ath12k_base *ab, u32 scan_config,
+				   u32 fw_mode_config);
 int ath12k_wmi_set_bios_cmd(struct ath12k_base *ab, u32 param_id,
 			    const u8 *buf, size_t buf_len);
 int ath12k_wmi_set_bios_sar_cmd(struct ath12k_base *ab, const u8 *psar_table);

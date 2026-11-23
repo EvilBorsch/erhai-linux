@@ -24,6 +24,7 @@
 #include <linux/spinlock.h>
 #include <linux/math.h>
 #include <linux/suspend.h>
+#include <linux/thermal.h>
 #include <linux/units.h>
 #include <linux/usb/pd.h>
 #include <linux/usb/role.h>
@@ -527,6 +528,16 @@ struct qcom_battmgr {
 	spinlock_t notify_lock;
 	bool removing;
 
+	/*
+	 * The battery temperature as a thermal sensor, in millidegrees: the
+	 * last reading passed to the zone and the last one read. Only the
+	 * zone's get_temp(), under the zone lock, uses these.
+	 */
+	int bat_tz_temp;
+	int bat_tz_last;
+	bool bat_tz_known;
+	bool bat_tz_failing;
+
 	/* Property id and value in the answer to the last accepted request */
 	u32 resp_property;
 	u32 resp_value;
@@ -770,8 +781,9 @@ static int qcom_battmgr_firmware_property(struct qcom_battmgr *battmgr, int opco
  * once the gauge has answered, all of the above holds. Only when the gauge
  * is found absent do the battery readings come from the firmware, as on
  * any other board of this firmware family. They are not used to steer the
- * charge: the pumps stay unregistered and the AP sets no float voltage and
- * no charge current of its own, see qcom_battmgr_buck_guard().
+ * buck: the AP sets no float voltage and no charge current of its own, see
+ * qcom_battmgr_buck_guard(). The pumps stay parked unless gaugeless_pps_ma
+ * lets PD PPS in, see qcom_battmgr_gaugeless_pumps().
  */
 #define ERHAI_PACK_DESIGN_UAH		11410000
 
@@ -787,6 +799,24 @@ static int qcom_battmgr_firmware_property(struct qcom_battmgr *battmgr, int opco
 #define GAUGE_DETECT_MS			1000
 #define GAUGE_DETECT_FAST_POLLS		60
 #define GAUGE_ABSENT_NACKS		10
+
+/*
+ * Fast charging on a board without the pack gauge. The stock system charges
+ * such a board through the pumps as well, from the firmware's battery
+ * readings; here it is opt-in and PD PPS only, see erhai_pps.c. 0 keeps the
+ * pumps parked: the firmware charges by itself from 5 V or a fixed 9 V
+ * contract. Any other value lets PPS in and is the ceiling of the current
+ * taken from the charger in mA (the pumps put about twice that into the
+ * pack); the stock ceiling is 5000. Read on every pass of the charge worker,
+ * so it can be lowered, or cleared to stop, while a charger is connected.
+ */
+static unsigned int gaugeless_pps_ma;
+module_param(gaugeless_pps_ma, uint, 0644);
+MODULE_PARM_DESC(gaugeless_pps_ma,
+		 "without the pack gauge: PD PPS fast charging up to this bus current in mA (0 = off, stock 5000)");
+
+/* The battery profile the firmware runs for the stock pack of this board. */
+#define ERHAI_FW_PACK_PROFILE		"Erhai_TABLET_12140MAH"
 
 static struct power_supply *qcom_battmgr_gauge(struct qcom_battmgr *b)
 {
@@ -1047,7 +1077,8 @@ static unsigned int qcom_battmgr_gauge_detect(struct qcom_battmgr *b)
 	b->buck = (struct erhai_buck){};
 	b->buck_error = 0;
 	qcom_battmgr_buck_invalidate(b);
-	dev_info(b->dev, "pack gauge not fitted: battery readings from the charger firmware, no AP fast charging\n");
+	dev_info(b->dev, "pack gauge not fitted: battery readings from the charger firmware, AP fast charging %s\n",
+		 READ_ONCE(gaugeless_pps_ma) ? "by gaugeless_pps_ma" : "off");
 	power_supply_changed(b->bat_psy);
 	return 0;
 }
@@ -1445,6 +1476,89 @@ static int qcom_battmgr_bat_get_property(struct power_supply *psy,
 	}
 
 	return 0;
+}
+
+/*
+ * The battery temperature as the sensor of a device tree thermal zone
+ * (#thermal-sensor-cells on the pmic-glink node), so that the board can cap
+ * the CPU and GPU clocks for the battery's sake and power off when the pack
+ * gets too hot. The firmware raises no temperature alarm: the zone polls.
+ *
+ * A reading the zone cannot use is reported as THERMAL_TEMP_INVALID, on which
+ * the thermal core keeps polling and leaves the cooling as it is. An error
+ * would instead make it retry with a growing delay and, after two minutes of
+ * failures, disable the zone together with its critical trip. Readings are
+ * unavailable until the firmware service is up and while it restarts.
+ */
+#define BATTMGR_TZ_TEMP_MIN	(-40 * MILLIDEGREE_PER_DEGREE)
+#define BATTMGR_TZ_TEMP_MAX	(120 * MILLIDEGREE_PER_DEGREE)
+/* More than the pack's temperature can change between two polls. */
+#define BATTMGR_TZ_TEMP_STEP	(5 * MILLIDEGREE_PER_DEGREE)
+
+static int qcom_battmgr_bat_get_temp(struct thermal_zone_device *tz, int *temp)
+{
+	struct qcom_battmgr *battmgr = thermal_zone_device_priv(tz);
+	union power_supply_propval val;
+	int ret, mc, last;
+
+	*temp = THERMAL_TEMP_INVALID;
+
+	ret = power_supply_get_property(battmgr->bat_psy, POWER_SUPPLY_PROP_TEMP, &val);
+	if (ret) {
+		/* -EAGAIN: the firmware service is not up (yet). */
+		if (ret != -EAGAIN && !battmgr->bat_tz_failing)
+			dev_warn(battmgr->dev, "no battery temperature for the thermal zone: %d\n",
+				 ret);
+		battmgr->bat_tz_failing = ret != -EAGAIN;
+		return 0;
+	}
+
+	mc = val.intval * MILLIDEGREE_PER_DECIDEGREE;
+	if (mc < BATTMGR_TZ_TEMP_MIN || mc > BATTMGR_TZ_TEMP_MAX) {
+		if (!battmgr->bat_tz_failing)
+			dev_warn(battmgr->dev, "battery temperature out of range: %d mC\n", mc);
+		battmgr->bat_tz_failing = true;
+		return 0;
+	}
+	battmgr->bat_tz_failing = false;
+
+	/*
+	 * A step the pack cannot make between two readings is passed on only
+	 * when the next reading confirms it, so that one wrong reading neither
+	 * powers the system off nor moves the cooling.
+	 */
+	last = battmgr->bat_tz_last;
+	battmgr->bat_tz_last = mc;
+	if (battmgr->bat_tz_known &&
+	    abs(mc - battmgr->bat_tz_temp) > BATTMGR_TZ_TEMP_STEP &&
+	    abs(mc - last) > BATTMGR_TZ_TEMP_STEP)
+		return 0;
+
+	battmgr->bat_tz_known = true;
+	battmgr->bat_tz_temp = mc;
+	*temp = mc;
+
+	return 0;
+}
+
+static const struct thermal_zone_device_ops qcom_battmgr_bat_tz_ops = {
+	.get_temp = qcom_battmgr_bat_get_temp,
+};
+
+/*
+ * A device tree without a zone for the sensor is fine. A zone that fails to
+ * register is reported, but the battery and the charger stay usable.
+ */
+static void qcom_battmgr_register_thermal(struct qcom_battmgr *battmgr)
+{
+	struct thermal_zone_device *tz;
+
+	if (!IS_ENABLED(CONFIG_THERMAL_OF))
+		return;
+
+	tz = devm_thermal_of_zone_register(battmgr->dev, 0, battmgr, &qcom_battmgr_bat_tz_ops);
+	if (IS_ERR(tz) && PTR_ERR(tz) != -ENODEV)
+		dev_err(battmgr->dev, "battery thermal zone not registered: %pe\n", tz);
 }
 
 static int qcom_battmgr_set_charge_control(struct qcom_battmgr *battmgr,
@@ -2640,6 +2754,7 @@ static unsigned int qcom_battmgr_pd_update(struct qcom_battmgr *battmgr)
 	struct erhai_probe_status status = {};
 	bool stable, ufcs_active, tail, probe_idle, prefer_pps, dedicated, can_probe, can_probe_pumps;
 	bool serial_source, detached, qc, try_qc, caps_changed, current_changed = false, bypass;
+	bool gaugeless = qcom_battmgr_gaugeless(battmgr);
 	u32 online, type = POWER_SUPPLY_USB_TYPE_UNKNOWN, health, vbat, vbus, ua, real_type;
 	int ret;
 
@@ -2689,10 +2804,21 @@ read_source:
 	status = (struct erhai_probe_status){ .wired_online = online && !detached };
 	if (online && !detached && battmgr->pps_ops)
 		battmgr->pps_ops->probe_status(battmgr->pps_data, &status);
+	/* Without the pack gauge the AP drives PD PPS only: the serial and
+	 * UFCS routes are never ready and no answer of a source counts as
+	 * evidence for them.
+	 */
+	if (gaugeless) {
+		status.ready &= ERHAI_PPS;
+		status.responded &= ERHAI_PPS;
+		status.delivering &= ERHAI_PPS;
+		status.first_ufcs_timeout = false;
+		status.serial_needs_buck_off = false;
+	}
 	scoped_guard(spinlock_irqsave, &battmgr->notify_lock) {
 		if (test_bit(PD_EVENT_DETACH, &battmgr->pd_events))
 			goto read_source;
-		if (online && !detached) {
+		if (online && !detached && !gaugeless) {
 			battmgr->retry_evidence |= (status.responded | status.delivering) & ERHAI_SERIAL;
 			if (test_and_clear_bit(PD_EVENT_SVOOC_RESPONSE, &battmgr->pd_events) ||
 			    (battmgr->pps_ops && battmgr->pps_ops->enabled() && real_type == 9))
@@ -2841,7 +2967,7 @@ read_source:
 		battmgr->retry_once |= battmgr->missing_routes & status.ready;
 		battmgr->missing_routes &= ~status.ready;
 	}
-	if (test_and_clear_bit(PD_EVENT_UFCS_RESPONSE, &battmgr->pd_events))
+	if (test_and_clear_bit(PD_EVENT_UFCS_RESPONSE, &battmgr->pd_events) && !gaugeless)
 		battmgr->retry_evidence |= ERHAI_UFCS;
 	stable = battmgr->pd_state == PD_ACTIVE || status.delivering;
 	if (stable && !battmgr->stable_seen) {
@@ -3281,6 +3407,54 @@ static void qcom_battmgr_pd_suspend(struct qcom_battmgr *battmgr)
 		dev_info(battmgr->dev, "PD: suspend at 5 V, input limit %u mA\n", ua / 1000);
 }
 
+/*
+ * The firmware cannot tell the AP that the pack is the stock one (the stock
+ * system asks a 1-wire chip in the pack for that); what it does tell is the
+ * battery profile it selected for the pack it found.
+ */
+static bool qcom_battmgr_gaugeless_pack(struct qcom_battmgr *b)
+{
+	int ret;
+
+	mutex_lock(&b->lock);
+	ret = qcom_battmgr_request_property(b, BATTMGR_BAT_PROPERTY_GET, BATT_MODEL_NAME, 0);
+	mutex_unlock(&b->lock);
+	return !ret && str_has_prefix(b->info.model_number, ERHAI_FW_PACK_PROFILE);
+}
+
+/*
+ * Without the pack gauge the pumps are let in and taken out again by
+ * gaugeless_pps_ma. Taking them out first ends a running session; until
+ * that has completed the engine stays registered and is asked again.
+ */
+static void qcom_battmgr_gaugeless_pumps(struct qcom_battmgr *b)
+{
+	unsigned int ma = READ_ONCE(gaugeless_pps_ma);
+
+	if (!qcom_battmgr_gaugeless(b))
+		return;
+	if (ma && b->pps_parked) {
+		if (!qcom_battmgr_gaugeless_pack(b)) {
+			dev_warn_once(b->dev, "gaugeless_pps_ma ignored: the firmware reports no %s battery profile\n",
+				      ERHAI_FW_PACK_PROFILE);
+			return;
+		}
+		b->pps_ops = b->pps_parked;
+		b->pps_parked = NULL;
+		dev_info(b->dev, "PD PPS fast charging on the firmware's battery readings: up to %u mA from the charger\n",
+			 min(ma, 5000U));
+	} else if (!ma && b->pps_ops) {
+		if (qcom_battmgr_pps_stop(b, false, "gaugeless-pps-off"))
+			return;
+		b->pps_parked = b->pps_ops;
+		b->pps_ops = NULL;
+		dev_info(b->dev, "PD PPS fast charging off: the firmware charges by itself\n");
+	} else {
+		return;
+	}
+	set_bit(PD_EVENT_CAPS, &b->pd_events);
+}
+
 static void qcom_battmgr_charge_worker(struct work_struct *work)
 {
 	struct qcom_battmgr *battmgr = container_of(to_delayed_work(work),
@@ -3303,6 +3477,7 @@ static void qcom_battmgr_charge_worker(struct work_struct *work)
 	}
 
 	gauge_delay = qcom_battmgr_gauge_detect(battmgr);
+	qcom_battmgr_gaugeless_pumps(battmgr);
 
 	qcom_battmgr_charge_limit_update(battmgr);
 
@@ -4830,6 +5005,20 @@ int erhai_pps_apdo_current(u32 min_mv, u32 max_mv, u32 *selected)
 }
 EXPORT_SYMBOL_GPL(erhai_pps_apdo_current);
 
+/*
+ * What steers the pumps: negative with the pack gauge (or while it is still
+ * being looked for, when the pumps are parked anyway). Without the gauge the
+ * ceiling of the PPS bus current in mA, 0 when fast charging is off.
+ */
+int erhai_pps_gaugeless_ma(void)
+{
+	guard(mutex)(&erhai_bridge_lock);
+	if (!erhai_battmgr || !qcom_battmgr_gaugeless(erhai_battmgr))
+		return -ENODEV;
+	return min(READ_ONCE(gaugeless_pps_ma), 5000U);
+}
+EXPORT_SYMBOL_GPL(erhai_pps_gaugeless_ma);
+
 /* Property traffic from PPS uses the existing serialized request channel. */
 int erhai_otg_adsp_prop_get(u32 opcode, u32 property)
 {
@@ -4939,8 +5128,9 @@ int erhai_pps_register(struct device *parent, const struct erhai_pps_ops *ops, v
 	/*
 	 * The pumps charge the cell directly, on the pack gauge's readings.
 	 * Where the device tree names that gauge they are only let in once
-	 * it has answered, see qcom_battmgr_gauge_detect(), and so never on
-	 * a board that turns out not to have it.
+	 * it has answered, see qcom_battmgr_gauge_detect(). On a board that
+	 * turns out not to have it they stay parked unless gaugeless_pps_ma
+	 * is set, see qcom_battmgr_gaugeless_pumps().
 	 */
 	if (qcom_battmgr_gauge_described(battmgr) &&
 	    battmgr->gauge_state != GAUGE_PRESENT)
@@ -5183,6 +5373,12 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
 	ret = qcom_battmgr_charging_init(battmgr);
 	if (ret)
 		return dev_err_probe(dev, ret, "cannot create charging interface\n");
+
+	/*
+	 * After the client release action, so that the zone stops reading
+	 * the battery before requests to the firmware are shut off.
+	 */
+	qcom_battmgr_register_thermal(battmgr);
 
 	if (battmgr->quirks & QCOM_BATTMGR_QUIRK_OPLUS_PD) {
 		ret = devm_device_init_wakeup(dev);

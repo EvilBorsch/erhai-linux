@@ -203,6 +203,8 @@ static const struct ath12k_wmi_tlv_policy ath12k_wmi_tlv_policies[] = {
 		.min_len = sizeof(struct wmi_p2p_noa_event) },
 	[WMI_TAG_11D_NEW_COUNTRY_EVENT] = {
 		.min_len = sizeof(struct wmi_11d_new_cc_event) },
+	[WMI_TAG_PDEV_SET_MAC_CONFIG_RESPONSE_EVENT] = {
+		.min_len = sizeof(struct wmi_pdev_set_mac_config_resp_event) },
 	[WMI_TAG_PER_CHAIN_RSSI_STATS] = {
 		.min_len = sizeof(struct wmi_per_chain_rssi_stat_params) },
 	[WMI_TAG_OBSS_COLOR_COLLISION_EVT] = {
@@ -4420,6 +4422,55 @@ int ath12k_wmi_set_hw_mode(struct ath12k_base *ab,
 	return ret;
 }
 
+/* Replace the dual MAC configuration the firmware starts with (reported in
+ * the service ready ext event) and wait for the firmware's answer.
+ */
+int ath12k_wmi_pdev_set_mac_config(struct ath12k_base *ab, u32 scan_config,
+				   u32 fw_mode_config)
+{
+	struct ath12k_wmi_base *wmi_ab = &ab->wmi_ab;
+	struct wmi_pdev_set_mac_config_cmd *cmd;
+	struct sk_buff *skb;
+	int ret;
+
+	skb = ath12k_wmi_alloc_skb(wmi_ab, sizeof(*cmd));
+	if (!skb)
+		return -ENOMEM;
+
+	cmd = (struct wmi_pdev_set_mac_config_cmd *)skb->data;
+	cmd->tlv_header = ath12k_wmi_tlv_cmd_hdr(WMI_TAG_PDEV_SET_MAC_CONFIG_CMD,
+						 sizeof(*cmd));
+	cmd->pdev_id = cpu_to_le32(WMI_PDEV_ID_SOC);
+	cmd->concurrent_scan_config_bits = cpu_to_le32(scan_config);
+	cmd->fw_mode_config_bits = cpu_to_le32(fw_mode_config);
+
+	ath12k_dbg(ab, ATH12K_DBG_WMI,
+		   "wmi pdev set mac config scan 0x%08x fw mode 0x%08x\n",
+		   scan_config, fw_mode_config);
+
+	reinit_completion(&wmi_ab->mac_config_done);
+
+	ret = ath12k_wmi_cmd_send(&wmi_ab->wmi[0], skb,
+				  WMI_PDEV_SET_MAC_CONFIG_CMDID);
+	if (ret) {
+		ath12k_warn(ab, "failed to send WMI_PDEV_SET_MAC_CONFIG_CMDID\n");
+		dev_kfree_skb(skb);
+		return ret;
+	}
+
+	if (!wait_for_completion_timeout(&wmi_ab->mac_config_done,
+					 WMI_SEND_TIMEOUT_HZ))
+		return -ETIMEDOUT;
+
+	if (wmi_ab->mac_config_status) {
+		ath12k_warn(ab, "firmware refused the mac config: status %u\n",
+			    wmi_ab->mac_config_status);
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
 int ath12k_wmi_cmd_init(struct ath12k_base *ab)
 {
 	struct ath12k_dp *dp = ath12k_ab_to_dp(ab);
@@ -5063,6 +5114,10 @@ static int ath12k_wmi_svc_rdy_ext_parse(struct ath12k_base *ab,
 			ath12k_warn(ab, "unable to extract ext params\n");
 			return ret;
 		}
+		ab->wmi_ab.default_conc_scan_config_bits =
+			svc_rdy_ext->arg.default_conc_scan_config_bits;
+		ab->wmi_ab.default_fw_config_bits =
+			svc_rdy_ext->arg.default_fw_config_bits;
 		break;
 
 	case WMI_TAG_SOC_MAC_PHY_HW_MODE_CAPS:
@@ -6917,6 +6972,31 @@ static int ath12k_pull_peer_assoc_conf_ev(struct ath12k_base *ab, struct sk_buff
 	peer_assoc_conf->macaddr = ev->peer_macaddr.addr;
 
 	return 0;
+}
+
+static void ath12k_wmi_pdev_set_mac_config_resp_event(struct ath12k_base *ab,
+						      struct sk_buff *skb)
+{
+	const struct wmi_pdev_set_mac_config_resp_event *ev;
+	const void **tb;
+
+	tb = ath12k_wmi_tlv_parse(ab, skb);
+	if (IS_ERR(tb)) {
+		ath12k_warn(ab, "failed to parse tlv: %ld\n", PTR_ERR(tb));
+		return;
+	}
+
+	ev = tb[WMI_TAG_PDEV_SET_MAC_CONFIG_RESPONSE_EVENT];
+	if (!ev) {
+		ath12k_warn(ab, "failed to fetch pdev set mac config resp ev\n");
+		return;
+	}
+
+	ath12k_dbg(ab, ATH12K_DBG_WMI, "wmi pdev set mac config resp status %u\n",
+		   le32_to_cpu(ev->status));
+
+	ab->wmi_ab.mac_config_status = le32_to_cpu(ev->status);
+	complete(&ab->wmi_ab.mac_config_done);
 }
 
 static void ath12k_wmi_op_ep_tx_credits(struct ath12k_base *ab)
@@ -10466,6 +10546,9 @@ static void ath12k_wmi_op_rx(struct ath12k_base *ab, struct sk_buff *skb)
 	case WMI_11D_NEW_COUNTRY_EVENTID:
 		ath12k_reg_11d_new_cc_event(ab, skb);
 		break;
+	case WMI_PDEV_SET_MAC_CONFIG_RESP_EVENTID:
+		ath12k_wmi_pdev_set_mac_config_resp_event(ab, skb);
+		break;
 	case WMI_PDEV_RSSI_DBM_CONVERSION_PARAMS_INFO_EVENTID:
 		ath12k_wmi_rssi_dbm_conversion_params_info_event(ab, skb);
 		break;
@@ -10788,6 +10871,7 @@ int ath12k_wmi_attach(struct ath12k_base *ab)
 	/* TODO: Init remaining wmi soc resources required */
 	init_completion(&ab->wmi_ab.service_ready);
 	init_completion(&ab->wmi_ab.unified_ready);
+	init_completion(&ab->wmi_ab.mac_config_done);
 
 	return 0;
 }

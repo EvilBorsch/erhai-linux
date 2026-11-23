@@ -116,6 +116,12 @@ properties:
   '#size-cells':
     const: 0
 
+  '#thermal-sensor-cells':
+    const: 0
+    description:
+      The battery temperature as the battery manager firmware measures it,
+      for a thermal zone that protects the battery.
+
   regulators:
     type: object
     additionalProperties: false
