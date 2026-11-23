@@ -116,18 +116,24 @@
 #define POGO_KB_TP_X_MAX		2764
 #define POGO_KB_TP_Y_MAX		1630
 #define POGO_KB_TP_RES			23	/* units per mm */
-/* Report trailer: scan time (le16), contact count, buttons */
+/* Report trailer: scan counter (le16), contact count, buttons */
 #define POGO_KB_TP_TRAILER_LEN		4
-#define POGO_KB_TP_SCAN_UNIT_US		100
 /*
- * Mapping the touch controller's scan time onto the monotonic clock: start
- * over after a pause long enough for the 16 bit scan time to wrap, or when
- * scan time and arrival disagree by more than any transfer delay; let the
- * offset rise as fast as a keyboard clock that runs slower than ours could
- * make it; never place a frame further back than the longest delay seen.
+ * The scan counter grows by 120 for every scan of the touch controller,
+ * about 118 a second, also for the scans the keyboard drops because nothing
+ * moved; after a longer rest it steps by 120 only.  Within a run of scans a
+ * frame's time is the previous one's plus the scans in between times the
+ * scan period, which is learnt from the arrivals; the run starts over after
+ * a gap or a step that is not a few whole scans.  The offset to the
+ * monotonic clock follows the smallest transfer delay seen and may rise as
+ * fast as a keyboard clock slower than ours could make it; no frame is
+ * placed further back than the longest transfer delay.
  */
-#define POGO_KB_TP_RESYNC_MS		3000
-#define POGO_KB_TP_DISAGREE_MS		50
+#define POGO_KB_TP_SCAN_STEP		120
+#define POGO_KB_TP_SCANS_MAX		4
+#define POGO_KB_TP_PERIOD_NS		8450000
+#define POGO_KB_TP_PERIOD_SHIFT		6	/* learning rate 1/64 */
+#define POGO_KB_TP_RESYNC_MS		50
 #define POGO_KB_TP_DRIFT_PPM		2000
 #define POGO_KB_TP_MAX_LAG_MS		30
 #define POGO_KB_TP_FW_GESTURES		0x17
@@ -161,16 +167,17 @@ static const struct pogo_kb_model pogo_kb_model_unknown = {
 
 /*
  * Touchpad experiments of the erhai test kernel.  All of them can be changed
- * at run time in /sys/module/oneplus_pogo_keyboard/parameters/; the defaults
- * keep the previous behaviour, so each one can be measured against it.
+ * at run time in /sys/module/oneplus_pogo_keyboard/parameters/, so each one
+ * can be measured against the previous behaviour.  Only tp_scan_time is on
+ * by default (measured, see pogo_kb_tp_time()).
  */
 static bool tp_trace;
 module_param(tp_trace, bool, 0644);
 MODULE_PARM_DESC(tp_trace, "Log every raw touchpad frame");
 
-static bool tp_scan_time;
+static bool tp_scan_time = true;
 module_param(tp_scan_time, bool, 0644);
-MODULE_PARM_DESC(tp_scan_time, "Timestamp touchpad frames with the touch controller's scan time");
+MODULE_PARM_DESC(tp_scan_time, "Timestamp touchpad frames by the touch controller's scan counter");
 
 static bool tp_palm;
 module_param(tp_palm, bool, 0644);
@@ -316,7 +323,8 @@ struct pogo_kb {
 	/* Touchpad clock and button state */
 	bool tp_clock_valid;
 	u16 tp_scan;
-	u64 tp_scan_ns;
+	u64 tp_frame_ns;
+	s64 tp_period_ns;
 	ktime_t tp_offset;
 	ktime_t tp_last_rx;
 	u32 tp_msc;
@@ -462,51 +470,60 @@ static void pogo_kb_report_media(struct pogo_kb *kb, const u8 *data, u8 len)
 }
 
 /*
- * The touch controller stamps every report with its scan time.  The keyboard
- * forwards reports unevenly, so two of them can arrive 2 ms apart after a
- * 15 ms gap; with the arrival time userspace would see an impossible speed
- * (libinput discards such motion as a jump).  Place each report at its scan
- * time instead, mapped onto the monotonic clock by the smallest transfer
- * delay seen.
+ * The keyboard forwards touchpad reports unevenly: two of them can arrive
+ * 2 ms apart after a 15 ms gap, although the touch controller scanned them
+ * 8.45 ms apart.  With the arrival time userspace sees an impossible speed
+ * (libinput discards such motion as a jump, about one a minute in use).
+ * Place each report at the time of its scan instead, from the scan counter.
+ * Checked against 5 minutes of the owner's frames (2871): reports closer
+ * than 5 ms from 38 to 6, libinput jumps from 9 to 1, a median 0.08 ms
+ * behind arrival.
  */
 static ktime_t pogo_kb_tp_time(struct pogo_kb *kb, u16 scan, ktime_t now)
 {
-	s64 elapsed = ktime_to_ns(ktime_sub(now, kb->tp_last_rx));
-	u64 step = (u64)(u16)(scan - kb->tp_scan) * POGO_KB_TP_SCAN_UNIT_US * NSEC_PER_USEC;
-	ktime_t t;
+	s64 gap = ktime_to_ns(ktime_sub(now, kb->tp_last_rx));
+	unsigned int step = (u16)(scan - kb->tp_scan);
+	unsigned int scans = step / POGO_KB_TP_SCAN_STEP;
+	s64 period = kb->tp_period_ns;
+	ktime_t t, envelope;
 
-	if (!kb->tp_clock_valid || elapsed > POGO_KB_TP_RESYNC_MS * NSEC_PER_MSEC ||
-	    abs((s64)step - elapsed) > POGO_KB_TP_DISAGREE_MS * NSEC_PER_MSEC) {
+	if (!kb->tp_clock_valid || step % POGO_KB_TP_SCAN_STEP || !scans ||
+	    scans > POGO_KB_TP_SCANS_MAX || gap > POGO_KB_TP_RESYNC_MS * NSEC_PER_MSEC) {
 		kb->tp_clock_valid = true;
-		kb->tp_scan_ns = 0;
+		kb->tp_frame_ns = 0;
 		kb->tp_offset = now;
 		kb->tp_msc = 0;
 	} else {
-		kb->tp_scan_ns += step;
-		kb->tp_msc += step / NSEC_PER_USEC;
+		/* Learn the period from arrivals that look like these scans */
+		if (2 * gap > scans * period && 2 * gap < 3 * scans * period)
+			kb->tp_period_ns = clamp_t(s64, period +
+						   div_s64(div_s64(gap, scans) - period,
+							   1 << POGO_KB_TP_PERIOD_SHIFT),
+						   POGO_KB_TP_PERIOD_NS * 3 / 4,
+						   POGO_KB_TP_PERIOD_NS * 5 / 4);
+		kb->tp_frame_ns += scans * period;
+		kb->tp_msc += div_s64(scans * period, NSEC_PER_USEC);
 		kb->tp_offset = ktime_add_ns(kb->tp_offset,
-					     div_s64(elapsed * POGO_KB_TP_DRIFT_PPM, 1000000));
+					     div_s64(gap * POGO_KB_TP_DRIFT_PPM, 1000000));
 	}
 	kb->tp_scan = scan;
 	kb->tp_last_rx = now;
 
 	/* A report cannot have been scanned after it arrived */
-	t = ktime_add_ns(kb->tp_offset, kb->tp_scan_ns);
-	if (ktime_after(t, now)) {
-		kb->tp_offset = ktime_sub_ns(now, kb->tp_scan_ns);
-		t = now;
-	} else if (ktime_ms_delta(now, t) > POGO_KB_TP_MAX_LAG_MS) {
+	envelope = ktime_sub_ns(now, kb->tp_frame_ns);
+	if (ktime_after(kb->tp_offset, envelope))
+		kb->tp_offset = envelope;
+	t = ktime_add_ns(kb->tp_offset, kb->tp_frame_ns);
+	if (ktime_ms_delta(now, t) > POGO_KB_TP_MAX_LAG_MS)
 		t = ktime_sub_ms(now, POGO_KB_TP_MAX_LAG_MS);
-		kb->tp_offset = ktime_sub_ns(t, kb->tp_scan_ns);
-	}
 
 	return t;
 }
 
 /*
  * data: one five byte slot per contact (id << 4 | tip << 1 | confidence, x
- * and y as little endian 16 bit values), then the trailer: scan time (le16,
- * 100 us units), the number of slots and the button byte.  The layout is the
+ * and y as little endian 16 bit values), then the trailer: the scan counter
+ * (le16, 120 a scan), the number of slots and the button byte.  The layout is the
  * one of the keyboard's HID descriptor, which the stock driver also follows.
  */
 static void pogo_kb_report_touchpad(struct pogo_kb *kb, const u8 *data, u8 len)
@@ -982,6 +999,7 @@ static int pogo_kb_register_inputs(struct pogo_kb *kb, u8 brand)
 	input_set_capability(tp, EV_MSC, MSC_TIMESTAMP);
 	input_set_capability(tp, EV_KEY, BTN_LEFT);
 	kb->tp_clock_valid = false;
+	kb->tp_period_ns = POGO_KB_TP_PERIOD_NS;
 	kb->tp_button = false;
 	kb->tp_button_dropped = false;
 	__set_bit(INPUT_PROP_BUTTONPAD, tp->propbit);
