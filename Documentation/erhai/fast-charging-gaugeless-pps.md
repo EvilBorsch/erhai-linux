@@ -164,8 +164,8 @@ Observations:
   the fixed 9 V contract gives (2.8 A). The stock system behaves the same (it suspends the buck as well).
 - The firmware's own fixed 9 V charging holds the cell at 4.49-4.51 V from about 86 %; the end of a PPS session at
   4.49 V is therefore normal, not a fault.
-- The engine logs one `taper vbus ...` line every 0.5 s while it runs (7200 lines an hour). That has to be rate
-  limited before the feature can be on by default.
+- The engine logs its `charging`/`taper vbus ...` line on the first 60 polls of a session only (`pps_log_ticks`,
+  30 s), then stays quiet until the session ends: in step 2 the lines stop 33 s after the pump engaged.
 - Still to do: drills `inhibit-charge`, suspend, cable pull and replug (battery under 80 %); steps 3-5 (battery
   20-50 %; steps 4-5 need a charger with a 5 A PPS range and a 5 A cable).
 
