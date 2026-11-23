@@ -136,6 +136,16 @@
 #define POGO_KB_TP_RESYNC_MS		50
 #define POGO_KB_TP_DRIFT_PPM		2000
 #define POGO_KB_TP_MAX_LAG_MS		30
+/*
+ * The touch controller sometimes loses a finger that is still down, mostly
+ * a moving one, for one or two scans and then finds it again close by (6 of
+ * 256 touches in the owner's recordings, gaps of 2 to 17 ms, up to 9 mm
+ * apart).  Reported as a lift and a new touch, the short piece in between
+ * reads as a tap, and libinput turns the next touch into tap-and-drag: a
+ * held button nobody pressed.  A contact that comes back within the
+ * debounce time and this distance is the same touch.
+ */
+#define POGO_KB_TP_LIFT_DIST_MM		15
 #define POGO_KB_TP_FW_GESTURES		0x17
 
 #define POGO_KB_VENDOR			0x22d9
@@ -190,6 +200,10 @@ MODULE_PARM_DESC(tp_fw_gestures, "Firmware touchpad gestures, set on attach: 0 o
 static bool tp_drop_touchdown_click;
 module_param(tp_drop_touchdown_click, bool, 0644);
 MODULE_PARM_DESC(tp_drop_touchdown_click, "Ignore a button press that arrives together with a new contact");
+
+static unsigned int tp_lift_debounce_ms = 25;
+module_param(tp_lift_debounce_ms, uint, 0644);
+MODULE_PARM_DESC(tp_lift_debounce_ms, "Report a lifted contact only once it stays away this long (0: at once)");
 
 static const unsigned char pogo_kb_hid_keys[256] = {
 	  0,   0,   0,   0,  30,  48,  46,  32,  18,  33,  34,  35,  23,  36,  37,  38,
@@ -330,6 +344,14 @@ struct pogo_kb {
 	u32 tp_msc;
 	bool tp_button;
 	bool tp_button_dropped;
+	/* Lifts held back for the debounce time, and where each contact was */
+	unsigned long tp_lift_pending;
+	ktime_t tp_lift_time[POGO_KB_TP_SLOTS];	/* arrival, for the debounce */
+	ktime_t tp_lift_ts[POGO_KB_TP_SLOTS];	/* event time of the lift */
+	ktime_t tp_last_ts;			/* last touchpad event time */
+	u16 tp_last_x[POGO_KB_TP_SLOTS];
+	u16 tp_last_y[POGO_KB_TP_SLOTS];
+	struct delayed_work tp_lift_work;
 
 	u8 xfer_cmd;
 	u16 xfer_crc;
@@ -520,6 +542,65 @@ static ktime_t pogo_kb_tp_time(struct pogo_kb *kb, u16 scan, ktime_t now)
 	return t;
 }
 
+/* Report the held-back lifts in @slots, in a frame of their own. */
+static void pogo_kb_tp_end_slots(struct pogo_kb *kb, unsigned long slots)
+{
+	struct input_dev *input = kb->tp;
+	ktime_t ts = kb->tp_last_ts;
+	bool touching = false;
+	unsigned int i;
+
+	/* At the time the contact went, as far as time never goes back */
+	for_each_set_bit(i, &slots, POGO_KB_TP_SLOTS) {
+		if (ktime_after(kb->tp_lift_ts[i], ts))
+			ts = kb->tp_lift_ts[i];
+		input_mt_slot(input, i);
+		input_mt_report_slot_inactive(input);
+	}
+	kb->tp_lift_pending &= ~slots;
+	input_set_timestamp(input, ts);
+	kb->tp_last_ts = ts;
+
+	for (i = 0; i < POGO_KB_TP_SLOTS; i++)
+		touching |= input_mt_is_active(&input->mt->slots[i]);
+	kb->touching = touching;
+
+	input_mt_sync_frame(input);
+	input_report_key(input, BTN_LEFT, kb->tp_button && !kb->tp_button_dropped);
+	input_sync(input);
+}
+
+/* Held-back lifts whose debounce time is over at @now. */
+static unsigned long pogo_kb_tp_lifts_due(struct pogo_kb *kb, ktime_t now)
+{
+	unsigned int ms = READ_ONCE(tp_lift_debounce_ms);
+	unsigned long due = 0;
+	unsigned int i;
+
+	for_each_set_bit(i, &kb->tp_lift_pending, POGO_KB_TP_SLOTS)
+		if (ktime_ms_delta(now, kb->tp_lift_time[i]) >= ms)
+			__set_bit(i, &due);
+
+	return due;
+}
+
+static void pogo_kb_tp_lift_work(struct work_struct *work)
+{
+	struct pogo_kb *kb = container_of(to_delayed_work(work), struct pogo_kb,
+					  tp_lift_work);
+	unsigned long due;
+
+	spin_lock(&kb->rx_lock);
+	if (kb->tp) {
+		due = pogo_kb_tp_lifts_due(kb, ktime_get());
+		if (due)
+			pogo_kb_tp_end_slots(kb, due);
+		if (kb->tp_lift_pending)
+			mod_delayed_work(system_highpri_wq, &kb->tp_lift_work, 1);
+	}
+	spin_unlock(&kb->rx_lock);
+}
+
 /*
  * data: one five byte slot per contact (id << 4 | tip << 1 | confidence, x
  * and y as little endian 16 bit values), then the trailer: the scan counter
@@ -530,8 +611,10 @@ static void pogo_kb_report_touchpad(struct pogo_kb *kb, const u8 *data, u8 len)
 {
 	struct input_dev *input = kb->tp;
 	ktime_t now = ktime_get();
-	unsigned int count, i;
+	unsigned int count, i, debounce = READ_ONCE(tp_lift_debounce_ms);
 	bool touching = false, new_contact = false, button;
+	unsigned long end;
+	ktime_t ts;
 
 	if (!input || len < 2)
 		return;
@@ -542,11 +625,37 @@ static void pogo_kb_report_touchpad(struct pogo_kb *kb, const u8 *data, u8 len)
 		return;
 	}
 
+	/*
+	 * Lifts held back so far: over when their time is up, or when the
+	 * contact is back too far away to be the same touch.  Either way they
+	 * end in a frame of their own, before this one.
+	 */
+	end = pogo_kb_tp_lifts_due(kb, now);
+	for (i = 0; i < count; i++) {
+		const u8 *slot = &data[i * POGO_KB_TP_SLOT_LEN];
+		unsigned int id = slot[0] >> 4;
+		int dx, dy;
+
+		if (id >= POGO_KB_TP_SLOTS || !(slot[0] & BIT(1)) ||
+		    !test_bit(id, &kb->tp_lift_pending) || test_bit(id, &end))
+			continue;
+		dx = get_unaligned_le16(&slot[1]) - kb->tp_last_x[id];
+		dy = get_unaligned_le16(&slot[3]) - kb->tp_last_y[id];
+		if (dx * dx + dy * dy > POGO_KB_TP_LIFT_DIST_MM * POGO_KB_TP_RES *
+					POGO_KB_TP_LIFT_DIST_MM * POGO_KB_TP_RES)
+			__set_bit(id, &end);
+		else
+			__clear_bit(id, &kb->tp_lift_pending);	/* the same touch */
+	}
+	if (end)
+		pogo_kb_tp_end_slots(kb, end);
+
+	ts = now;
 	if (count * POGO_KB_TP_SLOT_LEN + POGO_KB_TP_TRAILER_LEN <= len) {
 		ktime_t t = pogo_kb_tp_time(kb, get_unaligned_le16(&data[len - 4]), now);
 
 		if (READ_ONCE(tp_scan_time)) {
-			input_set_timestamp(input, t);
+			ts = t;
 			input_event(input, EV_MSC, MSC_TIMESTAMP, kb->tp_msc);
 		}
 		if (READ_ONCE(tp_trace))
@@ -555,6 +664,11 @@ static void pogo_kb_report_touchpad(struct pogo_kb *kb, const u8 *data, u8 len)
 	} else if (READ_ONCE(tp_trace)) {
 		dev_info(kb->dev, "tp %lld - %*ph\n", ktime_to_us(now), len, data);
 	}
+	/* Event time never goes back, also around held-back lifts */
+	if (ktime_before(ts, kb->tp_last_ts))
+		ts = kb->tp_last_ts;
+	input_set_timestamp(input, ts);
+	kb->tp_last_ts = ts;
 
 	for (i = 0; i < count; i++) {
 		const u8 *slot = &data[i * POGO_KB_TP_SLOT_LEN];
@@ -567,6 +681,21 @@ static void pogo_kb_report_touchpad(struct pogo_kb *kb, const u8 *data, u8 len)
 
 		if (down && !input_mt_is_active(&input->mt->slots[id]))
 			new_contact = true;
+
+		if (!down && debounce && input_mt_is_active(&input->mt->slots[id])) {
+			/* Not yet: it may be back in a scan or two */
+			if (!test_and_set_bit(id, &kb->tp_lift_pending)) {
+				kb->tp_lift_time[id] = now;
+				kb->tp_lift_ts[id] = ts;
+			}
+			mod_delayed_work(system_highpri_wq, &kb->tp_lift_work,
+					 msecs_to_jiffies(debounce) + 1);
+			continue;
+		}
+		if (down) {
+			kb->tp_last_x[id] = get_unaligned_le16(&slot[1]);
+			kb->tp_last_y[id] = get_unaligned_le16(&slot[3]);
+		}
 
 		input_mt_slot(input, id);
 		if (input_mt_report_slot_state(input, palm ? MT_TOOL_PALM : MT_TOOL_FINGER,
@@ -610,8 +739,12 @@ static void pogo_kb_release_touches(struct pogo_kb *kb)
 	}
 	input_mt_sync_frame(input);
 	input_report_key(input, BTN_LEFT, 0);
+	if (ktime_after(ktime_get(), kb->tp_last_ts))
+		kb->tp_last_ts = ktime_get();
+	input_set_timestamp(input, kb->tp_last_ts);
 	input_sync(input);
 	kb->touching = false;
+	kb->tp_lift_pending = 0;
 	kb->tp_button = false;
 	kb->tp_button_dropped = false;
 }
@@ -1048,7 +1181,9 @@ static void pogo_kb_unregister_inputs(struct pogo_kb *kb)
 	tp = kb->tp;
 	kb->kbd = NULL;
 	kb->tp = NULL;
+	kb->tp_lift_pending = 0;
 	spin_unlock(&kb->rx_lock);
+	cancel_delayed_work_sync(&kb->tp_lift_work);
 
 	if (tp)
 		input_unregister_device(tp);
@@ -1341,6 +1476,7 @@ static int pogo_kb_probe(struct serdev_device *serdev)
 	init_completion(&kb->echo_done);
 	init_completion(&kb->reply_done);
 	INIT_DELAYED_WORK(&kb->poll_work, pogo_kb_poll_work);
+	INIT_DELAYED_WORK(&kb->tp_lift_work, pogo_kb_tp_lift_work);
 	INIT_WORK(&kb->attach_work, pogo_kb_attach_work);
 	INIT_WORK(&kb->led_work, pogo_kb_led_work);
 
@@ -1407,6 +1543,7 @@ static void pogo_kb_remove(struct serdev_device *serdev)
 
 	disable_irq(kb->irq);
 	disable_delayed_work_sync(&kb->poll_work);
+	disable_delayed_work_sync(&kb->tp_lift_work);
 	disable_work_sync(&kb->attach_work);
 	disable_work_sync(&kb->led_work);
 
@@ -1425,6 +1562,7 @@ static int pogo_kb_suspend(struct device *dev)
 	cancel_delayed_work_sync(&kb->poll_work);
 	cancel_work_sync(&kb->attach_work);
 	cancel_work_sync(&kb->led_work);
+	cancel_delayed_work_sync(&kb->tp_lift_work);
 
 	mutex_lock(&kb->lock);
 
