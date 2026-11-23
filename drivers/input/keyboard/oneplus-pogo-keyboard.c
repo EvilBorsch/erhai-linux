@@ -236,6 +236,11 @@ static const struct {
  * user-assignable keys).  The split screen and device interconnect keys
  * have no standard equivalent and are not reported.  fn_code is the code
  * reported while the Fn key is held.
+ *
+ * The top left key, printed Esc, sends AC Back (0x0224), Android's Back.
+ * On Linux it is Escape (leaving full screen, closing dialogs); Android
+ * apps in Droidloom still go back on it, as Android falls back from
+ * ESCAPE to BACK.  With Fn it is Back (KEY_BACK, browsers' history back).
  */
 static const struct {
 	u16 usage;
@@ -251,7 +256,7 @@ static const struct {
 	{ 0x00e9, KEY_VOLUMEUP, KEY_F12 },
 	{ 0x00ea, KEY_VOLUMEDOWN, KEY_F11 },
 	{ 0x01d0, KEY_FN },
-	{ 0x0224, KEY_BACK },
+	{ 0x0224, KEY_ESC, KEY_BACK },
 	{ 0x0244, KEY_APPSELECT },
 	{ 0x02fa, KEY_ASSISTANT },
 	{ 0x038e, KEY_SCREENLOCK, KEY_F6 },
@@ -950,8 +955,11 @@ static int pogo_kb_register_inputs(struct pogo_kb *kb, u8 brand)
 	__set_bit(EV_REP, kbd->evbit);
 	for (i = 0; i < ARRAY_SIZE(kb->keymap); i++)
 		__set_bit(kb->keymap[i], kbd->keybit);
-	for (i = 0; i < ARRAY_SIZE(pogo_kb_media_keys); i++)
+	for (i = 0; i < ARRAY_SIZE(pogo_kb_media_keys); i++) {
 		__set_bit(pogo_kb_media_keys[i].code, kbd->keybit);
+		if (pogo_kb_media_keys[i].fn_code)
+			__set_bit(pogo_kb_media_keys[i].fn_code, kbd->keybit);
+	}
 	__clear_bit(KEY_RESERVED, kbd->keybit);
 	input_set_capability(kbd, EV_LED, LED_CAPSL);
 
