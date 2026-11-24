@@ -233,6 +233,7 @@ passed:
 |---|---|---|
 | charging, PPS or fixed 9 V | the firmware's + 1 from 55 % (equal below), never down while the charger feeds the pack | Charging |
 | the AP declares full (≤ 597 mA above 4440 mV, after FFC or on any charger) | climbs 1 % per 10 s to 100 % | Charging, then Full at 100 % |
+| 100 % shown for 300 s with no fast session running, FFC tail included | 100 % | Full while FFC still charges (stock `oplus_comm_report_full()`: `oplus,smooth_switch` lets `report_full_check_ffc()` pass during FFC) |
 | left on the charger at full | 100 %; the output stays off, recharge from 4390 mV | Full |
 | unplugged at full | 100 % then down at 150-300 s a step towards the firmware's figure (+1) | Discharging |
 | discharging | follows the firmware's figure down, never up; 1 % minimum until the cell is under 3.3 V | Discharging |
@@ -285,6 +286,20 @@ than 3.
 | 3 | replug at 95 %+ | no PPS (above 90 %), no FFC; the guard's full check ends the charge (`battery full`), `ui_soc` 100 | until Full |
 
 After each step save `dmesg` and the samples to `device-logs/` and note the result here.
+
+## On the tablet
+
+24.11.2026, kernel eb14, the owner's 100 W charger (PPS 3.3-21 V 5 A), normal use, from 73 % at 30 C:
+
+- PPS started by itself; the request followed the stock table (2500, 2000, 1500, 1000 mA from the charger, up to
+  4.3 A into the pack), 30-33 C. Shown percentage 100 % after 40 min, the firmware's own figure 100 % 3 min later.
+- After 85 min `erhai_pps: exit: battery limit`, then `gaugeless FFC: PPS session complete, output off for 15 s`,
+  `phase=3 step=0 FV=4630 mV FCC=1500000 uA` (cell 4460 mV, 31 C) and, 11 min later at 4540 mV (firmware 4540, pump
+  ADC 4535), `step=1 FCC=1000000 uA`. Highest cell reading 4539 mV.
+- Status Full 300 s after the FFC start (the row above): stock behaviour, not a fault.
+- The cable was pulled 15 min into FFC: `gaugeless FFC ended (charger removed or driver stopped): firmware charge
+  profile back, FV 4490 mV, FCC 4500000 uA, output on`.
+- Not seen yet: the natural FFC end with `battery full`, the recharge, 5 A (the table gives it only under 55 %).
 
 ## Open risks
 
