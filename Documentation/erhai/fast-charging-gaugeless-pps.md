@@ -2,7 +2,10 @@
 
 Branch `eb/fast-charging`. Written 2026-11-23. **On by default at 3000 mA** (branch `eb/fast-charging-on`): steps 0-3
 and all fault drills passed on the tablet on 2026-11-23 (see "Results on this tablet"). Steps 4-5 at the stock 5000 mA
-need a charger with a 5 A PPS range and a 5 A cable, which the owner does not have yet. Background:
+need a charger with a 5 A PPS range and a 5 A cable, which the owner does not have yet. **Since kernel `eb14`
+(`eb/charging`): 5000 mA by default** (`eb/fast-charging-5a`, owner's decision 2026-11-24, without a separate 5 A
+test), and a session that charges its table through hands over to the stock FFC tail and full decision
+(`ffc-gaugeless.md`, `gaugeless_ffc` and `gaugeless_full` on by default). Background:
 `fast-charging-no-gauge.md` (what the variant is, why fast charging was parked) and `bypass-charging.md` on branch
 `eb/bypass-charging` (the firmware protocol).
 
