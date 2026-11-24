@@ -630,6 +630,19 @@ struct qcom_battmgr {
 	bool buck_online;
 	struct erhai_buck buck;
 	struct erhai_buck_sample buck_sample;
+	/* gaugeless_ffc: the AP runs the stock tail, see qcom_battmgr_ffc_tick() */
+	struct {
+		bool active;		/* the AP owns float voltage and current */
+		bool fault;		/* a cross-check failed: not again on this plug */
+		const char *ending;	/* hand-back not yet acknowledged */
+		const char *end;	/* why the last tail ended */
+		int restore_fv_mv;	/* handed back to the firmware */
+		int fw_fv;		/* BATT_VOLT_MAX as the firmware had it, raw */
+		int fw_mv, pump_mv;	/* last cross-check pair */
+		u32 last_ua;
+		unsigned int stale, vdiff, iover;
+		unsigned long next;
+	} ffc;
 	int buck_fv_applied, buck_fcc_applied, buck_enable_applied;
 	int buck_para_applied, buck_full_applied, buck_error, buck_gauge_error;
 	bool buck_saved_fcc_valid;
@@ -821,6 +834,27 @@ MODULE_PARM_DESC(gaugeless_pps_ma,
 
 /* The battery profile the firmware runs for the stock pack of this board. */
 #define ERHAI_FW_PACK_PROFILE		"Erhai_TABLET_12140MAH"
+
+/*
+ * FFC (fast float charge) on a board without the pack gauge. The stock
+ * charger finishes the pack this way once a fast charging session has
+ * charged its table through: 15 s with the charge output off, then the buck
+ * at 4630 mV and 1500 mA, 1000 mA, until the cell reaches 4540 mV or the
+ * current falls under 1300 mA, 900 mA, then its ordinary float voltage and
+ * the full decision, see erhai_buck.h. Without the gauge the AP sets none of
+ * that by itself (qcom_battmgr_buck_guard()) and the firmware holds the cell
+ * at its pre-FFC voltage. Set, the AP runs the stock tail after a gaugeless
+ * PPS session that has charged its table through, on the firmware's battery
+ * readings checked against the master pump's battery ADC, see
+ * qcom_battmgr_ffc_tick(). Off by default until tested on the tablet
+ * (Documentation/erhai/ffc-gaugeless.md). Read on every pass of the charge
+ * worker: clearing it ends a running tail and gives the charge back to the
+ * firmware.
+ */
+static bool gaugeless_ffc;
+module_param(gaugeless_ffc, bool, 0644);
+MODULE_PARM_DESC(gaugeless_ffc,
+		 "without the pack gauge: finish the charge after PD PPS with the stock FFC (default off)");
 
 static struct power_supply *qcom_battmgr_gauge(struct qcom_battmgr *b)
 {
@@ -2062,6 +2096,14 @@ static ssize_t charge_contract_show(struct device *dev, struct device_attribute 
 		b->buck_sample.mv, b->buck_sample.ma, b->buck_sample.temp,
 		b->buck_sample_at ? (long long)jiffies_to_msecs(jiffies - b->buck_sample_at) : -1LL);
 	len += sysfs_emit_at(buf, len, "gauge=%s ", qcom_battmgr_gauge_name(b));
+	if (qcom_battmgr_gaugeless(b))
+		len += sysfs_emit_at(buf, len,
+			"gaugeless_ffc=%d ffc_gl=%s ffc_fw_mv=%d ffc_pump_mv=%d ffc_fw_fv=%d ffc_restore_fv_mv=%d ffc_gl_end=\"%s\" ",
+			READ_ONCE(gaugeless_ffc),
+			b->ffc.ending ? "ending" : b->ffc.active ? "active" :
+			b->ffc.fault ? "fault" : "off",
+			b->ffc.fw_mv, b->ffc.pump_mv, b->ffc.fw_fv, b->ffc.restore_fv_mv,
+			b->ffc.ending ?: b->ffc.end ?: "none");
 	if (b->pps_ops)
 		return b->pps_ops->describe(b->pps_data, buf, len);
 	return len + sysfs_emit_at(buf, len, "state=idle\n");
@@ -2252,11 +2294,20 @@ static void qcom_battmgr_restore_route(struct qcom_battmgr *b, unsigned int rout
 	}
 }
 
+static void qcom_battmgr_ffc_arm(struct qcom_battmgr *b);
+
 /* Stock recharge check: six qualified samples, COUNT_TIMELIMIT 4 s.
  * Only a completed direct session arms this latch, never SOC at attach.
+ * Without the pack gauge the engine reports one only for gaugeless_ffc.
  */
 static bool qcom_battmgr_tail_owned(struct qcom_battmgr *b)
 {
+	if (test_bit(PD_EVENT_TAIL, &b->pd_events) && qcom_battmgr_gaugeless(b)) {
+		clear_bit(PD_EVENT_TAIL, &b->pd_events);
+		if (!b->ffc.active)
+			qcom_battmgr_ffc_arm(b);
+		return b->tail_owned;
+	}
 	if (test_and_clear_bit(PD_EVENT_TAIL, &b->pd_events)) {
 		b->tail_owned = true;
 		b->recharge_samples = 0;
@@ -2463,7 +2514,7 @@ static int qcom_battmgr_buck_apply(struct qcom_battmgr *b)
 	bool enable = !buck->disable && !b->charge_policy_hold && !b->charge_inhibited &&
 		      !READ_ONCE(b->otg_request);
 	int ret, hint, para, region, ffc = 0;
-	u32 fcc;
+	u32 fcc, max_fcc;
 
 	if (buck->temp_region >= 7 &&
 	    b->buck_sample.mv > buck->fv_mv - ERHAI_BUCK_WARM_FV_MARGIN_MV &&
@@ -2495,6 +2546,13 @@ static int qcom_battmgr_buck_apply(struct qcom_battmgr *b)
 						BATT_CHG_CTRL_LIM, &fcc);
 			if (ret)
 				return ret;
+			/* As qcom_battmgr_pd_fcc(): the firmware reports a limit
+			 * above its ceiling and refuses that value on write.
+			 */
+			if (!qcom_battmgr_get_property(b, BATTMGR_BAT_PROPERTY_GET,
+						       BATT_CHG_CTRL_LIM_MAX, &max_fcc) &&
+			    max_fcc > 0 && fcc > max_fcc)
+				fcc = max_fcc;
 			b->buck_saved_fcc_ua = b->pd_restore_fcc ? b->pd_saved_fcc_ua : fcc;
 			b->buck_saved_fcc_valid = true;
 		}
@@ -2529,11 +2587,88 @@ static int qcom_battmgr_buck_apply(struct qcom_battmgr *b)
 				      &b->buck_enable_applied);
 }
 
+/*
+ * The guard's rule without the pack gauge, see qcom_battmgr_buck_guard():
+ * no charging below 0 C, from 53 C, from the battery overvoltage threshold,
+ * nor from 45 C above the warm float voltage until the warm recharge one.
+ */
+static bool qcom_battmgr_guard_withholds(const struct erhai_buck *buck, int mv)
+{
+	if (buck->temp_region < 2 || buck->temp_region > 7 || buck->over_voltage)
+		return true;
+	return buck->temp_region == 7 && mv > (buck->disable ? 4030 : 4130);
+}
+
+/* The master pump's battery ADC, pumps idle; @hold false turns it off. */
+static int qcom_battmgr_pump_cell_mv(struct qcom_battmgr *b, bool hold)
+{
+	const struct erhai_pps_ops *ops = b->pps_ops ?: b->pps_parked;
+
+	if (!ops || !ops->cell_mv || !b->pps_data)
+		return hold ? -ENODEV : 0;
+	return ops->cell_mv(b->pps_data, hold);
+}
+
+/*
+ * End a gaugeless FFC tail and give the charge back to the firmware: output
+ * off, the float voltage it had before (or the stock normal one, which it
+ * holds by itself as well), its own charge current, the gauge hints as the
+ * stock charger leaves them outside FFC and full, then the output as the
+ * guard would have it. Until all of that is acknowledged the output stays
+ * off and the charge worker tries again.
+ */
+static int qcom_battmgr_ffc_handback(struct qcom_battmgr *b, const char *why)
+{
+	struct erhai_buck *buck = &b->buck;
+	int ret, region;
+	bool enable;
+
+	b->ffc.ending = why;
+	ret = qcom_battmgr_buck_write(b, BATT_OPLUS_CHG_EN, 0, &b->buck_enable_applied);
+	ret = ret ?: qcom_battmgr_buck_write(b, BATT_VOLT_MAX, b->ffc.restore_fv_mv,
+					     &b->buck_fv_applied);
+	if (!ret && b->buck_saved_fcc_valid) {
+		ret = qcom_battmgr_buck_write(b, BATT_CHG_CTRL_LIM, b->buck_saved_fcc_ua,
+					      &b->buck_fcc_applied);
+		if (!ret)
+			b->buck_saved_fcc_valid = false;
+	}
+	if (!ret && buck->temp_region >= 0) {
+		region = buck->temp_region >= 2 ? buck->temp_region + 1 : buck->temp_region;
+		b->buck_gauge_error = qcom_battmgr_buck_write(b, BATT_OPLUS_FULL_PARA, region << 3,
+							      &b->buck_para_applied) ?:
+				      qcom_battmgr_buck_write(b, BATT_OPLUS_SET_FULL, 0,
+							      &b->buck_full_applied);
+	}
+	enable = !qcom_battmgr_guard_withholds(buck, b->buck_sample.mv) &&
+		 !b->charge_policy_hold && !b->charge_inhibited;
+	ret = ret ?: qcom_battmgr_buck_write(b, BATT_OPLUS_CHG_EN, enable,
+					     &b->buck_enable_applied);
+	if (ret) {
+		dev_warn_ratelimited(b->dev, "gaugeless FFC: handing the charge back to the firmware failed: %d; retrying\n",
+				     ret);
+		return ret;
+	}
+	qcom_battmgr_pump_cell_mv(b, false);
+	dev_info(b->dev, "gaugeless FFC ended (%s): firmware charge profile back, FV %d mV, FCC %d uA, output %s\n",
+		 why, b->ffc.restore_fv_mv, b->buck_fcc_applied, enable ? "on" : "off");
+	b->ffc.active = false;
+	b->ffc.ending = NULL;
+	b->ffc.end = why;
+	b->tail_owned = false;
+	/* The guard starts over on the next pass. */
+	b->buck = (struct erhai_buck){};
+	power_supply_changed(b->bat_psy);
+	return 0;
+}
+
 static int qcom_battmgr_buck_release(struct qcom_battmgr *b)
 {
 	bool enable;
 	int ret;
 
+	if (b->ffc.active)
+		return qcom_battmgr_ffc_handback(b, b->ffc.ending ?: "charger removed or driver stopped");
 	if (b->buck.phase == ERHAI_BUCK_OFF)
 		return 0;
 	if (!b->buck.normal_fv_mv) {
@@ -2599,6 +2734,8 @@ static int qcom_battmgr_buck_read(struct qcom_battmgr *b, struct erhai_buck_samp
  * the warm recharge voltage, and from the battery overvoltage threshold
  * until 200 mV below it (batt-them-thr, fv-mv and vbatt-ov-thr-mv of the
  * stock charger devicetree). Without a reading it takes it away as well.
+ * After a PD PPS session and with gaugeless_ffc set, the stock tail takes
+ * over until the charger is removed, see qcom_battmgr_ffc_tick().
  */
 static unsigned int qcom_battmgr_buck_guard(struct qcom_battmgr *b)
 {
@@ -2628,9 +2765,7 @@ static unsigned int qcom_battmgr_buck_guard(struct qcom_battmgr *b)
 		buck->over_voltage = true;
 	else if (mv < 4400)
 		buck->over_voltage = false;
-	disable = buck->temp_region < 2 || buck->temp_region > 7 || buck->over_voltage;
-	if (buck->temp_region == 7 && mv > (buck->disable ? 4030 : 4130))
-		disable = true;
+	disable = qcom_battmgr_guard_withholds(buck, mv);
 
 	if (disable != buck->disable || b->buck_error)
 		dev_info(b->dev, "charge output %s: cell %d mV, %s%d.%d C\n",
@@ -2656,6 +2791,208 @@ fail:
 	return PD_POLL_MS;
 }
 
+/* gaugeless_ffc limits, see qcom_battmgr_ffc_tick(). */
+#define ERHAI_FFC_POLL_MS		1000	/* while FFC charges */
+#define ERHAI_FFC_SLOW_MS		4000	/* stock COUNT_TIMELIMIT */
+#define ERHAI_FFC_CEILING_MV		4570
+#define ERHAI_FFC_VDIFF_MV		200
+#define ERHAI_FFC_BAD_SAMPLES		4
+#define ERHAI_FFC_STALE_SAMPLES		10
+/* fv-mv of the normal regions: what the firmware holds the cell at itself. */
+#define ERHAI_FFC_RESTORE_FV_MV		4490
+
+static bool qcom_battmgr_gaugeless_pack(struct qcom_battmgr *b);
+
+/*
+ * A gaugeless PPS session has charged its table through; the stock charger
+ * would now run FFC (oplus_comm_switch_ffc()). Take the buck over for that
+ * if everything the tail depends on is there; otherwise the firmware goes on
+ * charging by itself as it does without gaugeless_ffc.
+ */
+static void qcom_battmgr_ffc_arm(struct qcom_battmgr *b)
+{
+	const char *no = NULL;
+	int pump = -ENODEV, mv;
+	u32 fv;
+
+	if (!READ_ONCE(gaugeless_ffc))
+		return;
+	if (b->ffc.fault)
+		no = "a cross-check failed on this plug";
+	else if (!b->buck_online || READ_ONCE(b->otg_request))
+		no = "no charger";
+	else if (b->charge_policy_hold || b->charge_inhibited || b->charge_error ||
+		 READ_ONCE(b->charge_bypass))
+		no = "charging inhibited";
+	else if (b->buck.phase == ERHAI_BUCK_OFF || b->buck.disable || b->buck_error)
+		no = "the charge guard withholds charging";
+	/* As for PPS: the stock pack by the firmware's battery profile. */
+	else if (!qcom_battmgr_gaugeless_pack(b))
+		no = "the firmware reports no " ERHAI_FW_PACK_PROFILE " battery profile";
+	else if ((pump = qcom_battmgr_pump_cell_mv(b, true)) < 0 && pump != -ENODATA)
+		no = "the pump battery ADC cannot be read";
+	if (no) {
+		qcom_battmgr_pump_cell_mv(b, false);
+		b->ffc.end = no;
+		dev_info(b->dev, "gaugeless FFC not started: %s\n", no);
+		return;
+	}
+
+	/* What to give back: the firmware's float voltage if it reads as one. */
+	b->ffc.fw_fv = qcom_battmgr_get_property(b, BATTMGR_BAT_PROPERTY_GET,
+						  BATT_VOLT_MAX, &fv) ? -1 : (int)fv;
+	mv = b->ffc.fw_fv >= 1000000 ? b->ffc.fw_fv / 1000 : b->ffc.fw_fv;
+	b->ffc.restore_fv_mv = mv >= 4400 && mv <= ERHAI_FFC_RESTORE_FV_MV + 10 ?
+			       mv : ERHAI_FFC_RESTORE_FV_MV;
+	b->ffc.active = true;
+	b->ffc.ending = b->ffc.end = NULL;
+	b->ffc.fw_mv = 0;
+	b->ffc.pump_mv = pump;
+	b->ffc.last_ua = U32_MAX;
+	b->ffc.stale = b->ffc.vdiff = b->ffc.iover = 0;
+	b->ffc.next = jiffies;
+	b->tail_owned = true;
+	b->buck_error = 0;
+	/* switch_ffc: 15 s with the output off, then ffc_start_work. */
+	erhai_buck_pump_done(&b->buck, jiffies);
+	dev_info(b->dev, "gaugeless FFC: PPS session complete, output off for 15 s, then FFC; firmware FV %d, handed back as %d mV\n",
+		 b->ffc.fw_fv, b->ffc.restore_fv_mv);
+	power_supply_changed(b->bat_psy);
+}
+
+static unsigned int qcom_battmgr_ffc_stop(struct qcom_battmgr *b, const char *why, bool fault)
+{
+	b->ffc.fault |= fault;
+	return qcom_battmgr_ffc_handback(b, why) ? PD_POLL_MS : 1;
+}
+
+/*
+ * The stock tail on a board without the pack gauge (gaugeless_ffc), from
+ * qcom_battmgr_ffc_arm() until the charger is removed: erhai_buck_update()
+ * and qcom_battmgr_buck_apply() as with the gauge, on the firmware's battery
+ * readings. They steer a float voltage 140 mV above the firmware's own, so
+ * on every sample, once a second while FFC charges:
+ *
+ * - all of them have to be there, and the cell voltage has to agree with
+ *   the master pump's battery ADC within 200 mV (pumps idle, its ADC held
+ *   on); the higher of the two is the cell voltage that steers the tail;
+ * - the cell voltage stays under a hard ceiling of 4570 mV, between the
+ *   stock FFC step voltage (4540 mV) and the battery overvoltage threshold
+ *   (4600 mV);
+ * - while FFC charges, the current reading has to move and the pack current
+ *   has to stay near the FFC charge current the AP set.
+ *
+ * Four failed voltage checks in a row (ten readings of a current that does
+ * not move, eight of a current above the limit), a reading at the ceiling,
+ * a failed write, the pumps in use or a restart of the charger firmware end
+ * the tail for this plug. So do clearing gaugeless_ffc, charging inhibited
+ * by policy (bypass, charge limit), removing the charger and suspend. Every
+ * end gives the charge back to the firmware, see qcom_battmgr_ffc_handback().
+ */
+static unsigned int qcom_battmgr_ffc_tick(struct qcom_battmgr *b)
+{
+	struct erhai_buck *buck = &b->buck;
+	struct erhai_buck_sample s;
+	enum erhai_buck_phase previous = buck->phase;
+	unsigned int step = buck->step;
+	u32 uv, ua, temp, soc, cycles;
+	const char *fault = NULL;
+	int pump, fcc_ma, ret;
+	bool fast = buck->phase == ERHAI_FFC_FAST;
+
+	if (b->ffc.ending)
+		return qcom_battmgr_ffc_handback(b, b->ffc.ending) ? PD_POLL_MS : 1;
+	if (!READ_ONCE(gaugeless_ffc))
+		return qcom_battmgr_ffc_stop(b, "gaugeless_ffc cleared", false);
+	if (b->charge_policy_hold || b->charge_inhibited || b->charge_error ||
+	    READ_ONCE(b->charge_bypass))
+		return qcom_battmgr_ffc_stop(b, "charging inhibited", false);
+	if (qcom_battmgr_pps_running(b)) {
+		/* The session may still be handing the port back: wait with
+		 * the output off, as long as the stock 15 s wait again.
+		 */
+		if (buck->phase != ERHAI_FFC_WAIT ||
+		    time_after(jiffies, buck->wait_until + msecs_to_jiffies(15000)))
+			return qcom_battmgr_ffc_stop(b, "the pumps are in use", true);
+		if (qcom_battmgr_buck_write(b, BATT_OPLUS_CHG_EN, 0, &b->buck_enable_applied))
+			return qcom_battmgr_ffc_stop(b, "charge control write failed", true);
+		return PD_POLL_MS;
+	}
+	if (time_before(jiffies, b->ffc.next))
+		return jiffies_to_msecs(b->ffc.next - jiffies) ?: 1;
+
+	ret = qcom_battmgr_get_property(b, BATTMGR_BAT_PROPERTY_GET, BATT_VOLT_NOW, &uv);
+	ret = ret ?: qcom_battmgr_get_property(b, BATTMGR_BAT_PROPERTY_GET, BATT_CURR_NOW, &ua);
+	ret = ret ?: qcom_battmgr_get_property(b, BATTMGR_BAT_PROPERTY_GET, BATT_TEMP, &temp);
+	ret = ret ?: qcom_battmgr_get_property(b, BATTMGR_BAT_PROPERTY_GET, BATT_CAPACITY, &soc);
+	ret = ret ?: qcom_battmgr_get_property(b, BATTMGR_BAT_PROPERTY_GET, BATT_CYCLE_COUNT,
+					    &cycles);
+	if (!ret && (!uv || soc > 10000 || ua == BIT(31)))
+		ret = -ENODATA;
+	if (ret) {
+		dev_warn(b->dev, "gaugeless FFC: battery readings unavailable: %d\n", ret);
+		return qcom_battmgr_ffc_stop(b, "battery readings unavailable", true);
+	}
+	pump = qcom_battmgr_pump_cell_mv(b, true);
+	b->ffc.fw_mv = uv / 1000;
+	b->ffc.pump_mv = pump;
+	b->ffc.vdiff = pump < 0 || abs(b->ffc.fw_mv - pump) > ERHAI_FFC_VDIFF_MV ?
+		       b->ffc.vdiff + 1 : 0;
+	b->ffc.stale = fast && ua == b->ffc.last_ua ? b->ffc.stale + 1 : 0;
+	b->ffc.last_ua = ua;
+	s = (struct erhai_buck_sample){
+		.mv = max(b->ffc.fw_mv, pump), .ma = -(s32)ua / 1000,
+		.temp = (s32)temp / 10, .soc = soc / 100, .cycles = cycles,
+		/* Armed only for the stock pack's profile, see above. */
+		.qualified = true,
+	};
+	fcc_ma = b->buck_fcc_applied > 0 ? b->buck_fcc_applied / 1000 : 0;
+	b->ffc.iover = fast && fcc_ma && s.ma > fcc_ma + fcc_ma / 5 + 300 ?
+		       b->ffc.iover + 1 : 0;
+
+	if (s.mv >= ERHAI_FFC_CEILING_MV)
+		fault = "cell voltage at the ceiling";
+	else if (b->ffc.vdiff >= ERHAI_FFC_BAD_SAMPLES)
+		fault = "cell voltage disagrees with the pump ADC";
+	else if (b->ffc.stale >= ERHAI_FFC_STALE_SAMPLES)
+		fault = "current reading does not change";
+	else if (b->ffc.iover >= 2 * ERHAI_FFC_BAD_SAMPLES)
+		fault = "charge current above the FFC limit";
+	if (fault) {
+		dev_warn(b->dev, "gaugeless FFC: %s: firmware %d mV %d mA, pump vbat %d mV, FCC %d mA, phase %u\n",
+			 fault, b->ffc.fw_mv, s.ma, pump, fcc_ma, buck->phase);
+		return qcom_battmgr_ffc_stop(b, fault, true);
+	}
+
+	b->buck_sample = s;
+	b->buck_sample_at = jiffies;
+	erhai_buck_update(buck, &s, jiffies);
+	/* The guard's rule without the gauge: nothing below 0 C. */
+	if (buck->temp_region < 2)
+		buck->disable = true;
+	ret = qcom_battmgr_buck_apply(b);
+	if (ret) {
+		dev_warn(b->dev, "gaugeless FFC: charge control write failed: %d\n", ret);
+		return qcom_battmgr_ffc_stop(b, "charge control write failed", true);
+	}
+	b->buck_error = 0;
+	if (buck->recharged) {
+		/* PPS stays done for this plug; the buck recharges. */
+		buck->recharged = false;
+		dev_info(b->dev, "gaugeless FFC: recharge at %d mV\n", s.mv);
+	}
+	if (previous != buck->phase || step != buck->step) {
+		dev_info(b->dev, "gaugeless FFC: phase=%u step=%u FV=%d mV FCC=%d uA enable=%d cell=%d mV (firmware %d, pump %d) %d mA soc %d%% %s%d.%d C\n",
+			 buck->phase, buck->step, b->buck_fv_applied, b->buck_fcc_applied,
+			 b->buck_enable_applied, s.mv, b->ffc.fw_mv, pump, s.ma, s.soc,
+			 s.temp < 0 ? "-" : "", abs(s.temp) / 10, abs(s.temp) % 10);
+		power_supply_changed(b->bat_psy);
+	}
+	b->ffc.next = jiffies + msecs_to_jiffies(buck->phase == ERHAI_FFC_FAST ?
+						  ERHAI_FFC_POLL_MS : ERHAI_FFC_SLOW_MS);
+	return jiffies_to_msecs(b->ffc.next - jiffies) ?: 1;
+}
+
 static unsigned int qcom_battmgr_buck_tick(struct qcom_battmgr *b)
 {
 	struct erhai_buck_sample sample;
@@ -2665,8 +3002,10 @@ static unsigned int qcom_battmgr_buck_tick(struct qcom_battmgr *b)
 
 	if (!b->buck_online || READ_ONCE(b->otg_request))
 		return 0;
-	if (qcom_battmgr_gaugeless(b))
-		return qcom_battmgr_buck_guard(b);
+	if (qcom_battmgr_gaugeless(b)) {
+		qcom_battmgr_tail_owned(b); /* a PPS session may have just completed */
+		return b->ffc.active ? qcom_battmgr_ffc_tick(b) : qcom_battmgr_buck_guard(b);
+	}
 	qcom_battmgr_tail_owned(b); /* A pump may have just published completion. */
 	if (b->serial_probe || qcom_battmgr_pps_running(b) ||
 	    (b->pps_ops && b->pps_ops->ufcs_active(b->pps_data)))
@@ -2769,6 +3108,12 @@ static unsigned int qcom_battmgr_pd_update(struct qcom_battmgr *battmgr)
 		battmgr->aicl_done = false;
 		qcom_battmgr_buck_invalidate(battmgr);
 		battmgr->buck.next_sample = jiffies;
+		/* Not FFC on a firmware that has just restarted under it. */
+		if (battmgr->ffc.active && !battmgr->ffc.ending) {
+			dev_warn(battmgr->dev, "gaugeless FFC: charger firmware restarted\n");
+			battmgr->ffc.fault = true;
+			battmgr->ffc.ending = "charger firmware restarted";
+		}
 	}
 	if (test_and_clear_bit(PD_EVENT_RESET, &battmgr->pd_events)) {
 		qcom_battmgr_buck_invalidate(battmgr);
@@ -2862,6 +3207,7 @@ read_source:
 			WRITE_ONCE(battmgr->tail_route, 0);
 		}
 		battmgr->recharge_samples = 0;
+		battmgr->ffc.fault = false;
 		battmgr->stable_seen = false;
 		battmgr->missing_routes = battmgr->retry_pending = 0;
 		battmgr->retry_stopping = false;
@@ -3611,7 +3957,10 @@ static int qcom_battmgr_pm_notify(struct notifier_block *nb,
 		if (battmgr->pps_ops)
 			battmgr->pps_ops->probe_status(battmgr->pps_data, &status);
 		battmgr->suspend_route = status.delivering;
-		if (qcom_battmgr_pps_stop(battmgr, false, "suspend")) {
+		/* Nobody supervises the tail while asleep: hand it back. */
+		if ((battmgr->ffc.active &&
+		     qcom_battmgr_ffc_handback(battmgr, battmgr->ffc.ending ?: "suspend")) ||
+		    qcom_battmgr_pps_stop(battmgr, false, "suspend")) {
 			mutex_unlock(&battmgr->charge_lock);
 			WRITE_ONCE(battmgr->pps_suspended, false);
 			qcom_battmgr_charge_kick(battmgr);
@@ -5022,6 +5371,19 @@ int erhai_pps_gaugeless_ma(void)
 	return min(READ_ONCE(gaugeless_pps_ma), 5000U);
 }
 EXPORT_SYMBOL_GPL(erhai_pps_gaugeless_ma);
+
+/*
+ * Whether a gaugeless PPS session that has charged its table through hands
+ * the tail to the battery manager's FFC (gaugeless_ffc), see
+ * qcom_battmgr_ffc_arm(), which checks the rest.
+ */
+bool erhai_gaugeless_ffc(void)
+{
+	guard(mutex)(&erhai_bridge_lock);
+	return erhai_battmgr && qcom_battmgr_gaugeless(erhai_battmgr) &&
+	       READ_ONCE(gaugeless_ffc);
+}
+EXPORT_SYMBOL_GPL(erhai_gaugeless_ffc);
 
 /* Property traffic from PPS uses the existing serialized request channel. */
 int erhai_otg_adsp_prop_get(u32 opcode, u32 property)

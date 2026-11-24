@@ -44,7 +44,12 @@
  * pump holds the firmware's readings against the pumps' own ADCs, see
  * pps_gaugeless_check(). A session that fails that check, or has charged
  * the table through, is not repeated before the charger is replugged; the
- * firmware then charges from a fixed contract as it does without this.
+ * firmware then charges from a fixed contract as it does without this, or,
+ * after a session that charged the table through and with the battery
+ * manager's gaugeless_ffc set, the battery manager finishes the charge with
+ * the stock FFC on the buck. For its cross-check the engine lends it the
+ * master pump's battery ADC while the pumps are idle, see
+ * erhai_pps_cell_mv().
  */
 
 #include <linux/platform_device.h>
@@ -396,6 +401,7 @@ struct erhai_pps {
 	unsigned int		gl_stale;
 	unsigned int		gl_vdiff;
 	unsigned int		gl_idiff;
+	bool			ffc_adc;	/* ADC held for the battery manager's FFC */
 };
 
 /*
@@ -417,14 +423,17 @@ static int pps_cv(struct erhai_pps *p, int temp)
 }
 
 /* The pack is done by this route: with the gauge the buck supervisor takes
- * the tail; without it the firmware finishes from a fixed contract.
+ * the tail; without it the firmware finishes from a fixed contract, or the
+ * battery manager does with FFC where gaugeless_ffc asks for that.
  */
 static void pps_tail_complete(struct erhai_pps *p)
 {
-	if (p->gaugeless)
+	if (p->gaugeless) {
 		p->gl_done = true;
-	else
-		erhai_charge_tail_complete(p->ufcs ? ERHAI_UFCS : ERHAI_PPS);
+		if (!erhai_gaugeless_ffc())
+			return;
+	}
+	erhai_charge_tail_complete(p->ufcs ? ERHAI_UFCS : ERHAI_PPS);
 }
 
 static void pps_enter(struct erhai_pps *p, enum pps_state st, const char *why);
@@ -1621,10 +1630,43 @@ static void erhai_pps_recharge(void *data)
 	p->retry_at = jiffies;
 }
 
+/*
+ * The master pump's battery ADC for the battery manager's FFC cross-check
+ * (no pack gauge, pumps idle, see qcom_battmgr_ffc_tick()). The ADC is held
+ * on as for a PPS session; nothing switches. Refused while the engine owns
+ * the pumps: FFC only follows a finished session and must not overlap one.
+ */
+static int erhai_pps_cell_mv(void *data, bool hold)
+{
+	struct erhai_pps *p = data;
+	int vbat, rc;
+
+	if (!hold) {
+		if (p->ffc_adc && p->state == PPS_IDLE && !p->cleanup && !p->adc_held)
+			pps_sc_adc_hold(false);
+		p->ffc_adc = false;
+		return 0;
+	}
+	if (p->state != PPS_IDLE || p->cleanup || pps_sc_delivering() || pps_sc_identifying())
+		return -EBUSY;
+	if (!p->ffc_adc) {
+		rc = pps_sc_adc_hold(true);
+		if (rc)
+			return rc;
+		p->ffc_adc = true;
+	}
+	rc = sc8547a_pps_snapshot(NULL, &vbat, NULL);
+	if (rc)
+		return rc;
+	/* A converter that has not finished its first conversion reads 0. */
+	return vbat > 2500 ? vbat : -ENODATA;
+}
+
 static void erhai_pps_detached(void *data)
 {
 	struct erhai_pps *p = data;
 
+	erhai_pps_cell_mv(p, false);
 	p->pps_protection = p->ufcs_protection = false;
 	p->gl_done = p->gl_hot = false;
 	p->cp_vbat_at = 0;
@@ -1679,6 +1721,7 @@ static const struct erhai_pps_ops erhai_pps_ops = {
 	.update = erhai_pps_update,
 	.stop = erhai_pps_stop,
 	.detached = erhai_pps_detached,
+	.cell_mv = erhai_pps_cell_mv,
 };
 
 static int erhai_pps_probe(struct platform_device *pdev)
