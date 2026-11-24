@@ -140,6 +140,8 @@ enum qcom_battmgr_variant {
 /* OPLUS firmware: set to 0 to stop charging, the system keeps running on input */
 /* Charger firmware gauge qualification properties. */
 #define BATT_OPLUS_AUTH			30
+/* BATT_RTC_SOC: where the stock charger keeps the percentage over a reboot. */
+#define BATT_OPLUS_RTC_SOC		31
 #define BATT_OPLUS_HMAC			40
 #define BATT_OPLUS_FULL_PARA		48
 #define BATT_OPLUS_SET_FULL		64
@@ -3963,9 +3965,6 @@ static bool qcom_battmgr_uisoc_shown(struct qcom_battmgr *b)
 	       READ_ONCE(b->uisoc.ready);
 }
 
-/* BATT_RTC_SOC: where the stock charger keeps the percentage over a reboot. */
-#define BATT_OPLUS_RTC_SOC		31
-
 /*
  * The stock percentage on a board without the pack gauge (erhai_uisoc.h),
  * on its own freezable work: it runs with and without a charger, every
@@ -5096,6 +5095,7 @@ static void qcom_battmgr_sm8350_callback(struct qcom_battmgr *battmgr,
 		case BATT_CHG_CTRL_LIM:
 		case BATT_CHG_CTRL_LIM_MAX:
 		case BATT_OPLUS_AUTH:
+		case BATT_OPLUS_RTC_SOC:
 		case BATT_OPLUS_HMAC:
 			/* Only read through qcom_battmgr_get_property() */
 			break;
