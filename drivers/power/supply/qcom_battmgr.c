@@ -810,11 +810,15 @@ static int qcom_battmgr_firmware_property(struct qcom_battmgr *battmgr, int opco
  * stock ceiling is 5000. Read on every pass of the charge worker, so it can
  * be lowered, or cleared to stop, while a charger is connected.
  *
- * On by default at 3000 since the test plan's steps 0-3 and fault drills
- * passed on the tablet (Documentation/erhai/fast-charging-gaugeless-pps.md);
- * the stock 5000 waits for a test with a 5 A PPS charger and cable.
+ * On by default at the stock ceiling of 5000: steps 0-3 and the fault drills
+ * passed on the tablet at up to 3000 (Documentation/erhai/
+ * fast-charging-gaugeless-pps.md); the owner chose the stock 5000 on
+ * 2026-11-24 without a separate 5 A test, relying on the engine's own limits
+ * (stock table by charge level and temperature, 3 A from 43 C, 4 A per pump,
+ * pack over 11.4 A for 8 s ends the session, the cross-check, the battery
+ * thermal zone). A cable without a 5 A e-marker keeps the charger at 3 A.
  */
-static unsigned int gaugeless_pps_ma = 3000;
+static unsigned int gaugeless_pps_ma = 5000;
 module_param(gaugeless_pps_ma, uint, 0644);
 MODULE_PARM_DESC(gaugeless_pps_ma,
 		 "without the pack gauge: PD PPS fast charging up to this bus current in mA (0 = off, stock 5000)");
