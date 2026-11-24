@@ -32,6 +32,7 @@
 
 #include "erhai_cell_envelope.h"
 #include "erhai_buck.h"
+#include "erhai_uisoc.h"
 #include "erhai_otg_glink.h"
 
 #define BATTMGR_CHEMISTRY_LEN	4
@@ -643,6 +644,18 @@ struct qcom_battmgr {
 		unsigned int stale, vdiff, iover;
 		unsigned long next;
 	} ffc;
+	/* gaugeless_full, see qcom_battmgr_uisoc_worker() */
+	bool guard_withheld;
+	int pack;			/* stock battery profile: -1 not known yet */
+	unsigned long pack_at;
+	struct mutex uisoc_lock;
+	struct erhai_uisoc uisoc;	/* @uisoc_lock */
+	struct delayed_work uisoc_work;
+	int uisoc_fw_soc;
+	bool uisoc_fastchg;
+	atomic_long_t uisoc_sleep_s;
+	ktime_t uisoc_suspend_at;
+	bool uisoc_backup_failed;
 	int buck_fv_applied, buck_fcc_applied, buck_enable_applied;
 	int buck_para_applied, buck_full_applied, buck_error, buck_gauge_error;
 	bool buck_saved_fcc_valid;
@@ -846,15 +859,34 @@ MODULE_PARM_DESC(gaugeless_pps_ma,
  * at its pre-FFC voltage. Set, the AP runs the stock tail after a gaugeless
  * PPS session that has charged its table through, on the firmware's battery
  * readings checked against the master pump's battery ADC, see
- * qcom_battmgr_ffc_tick(). Off by default until tested on the tablet
- * (Documentation/erhai/ffc-gaugeless.md). Read on every pass of the charge
- * worker: clearing it ends a running tail and gives the charge back to the
+ * qcom_battmgr_ffc_tick(). Read on every pass of the charge worker:
+ * clearing it ends a running tail and gives the charge back to the
  * firmware.
+ *
+ * On by default: the owner accepts the battery profile the firmware selected
+ * for the pack as the identity check the stock system makes with the pack's
+ * 1-wire chip, as for PPS (2026-11-24, Documentation/erhai/ffc-gaugeless.md).
  */
-static bool gaugeless_ffc;
+static bool gaugeless_ffc = true;
 module_param(gaugeless_ffc, bool, 0644);
 MODULE_PARM_DESC(gaugeless_ffc,
-		 "without the pack gauge: finish the charge after PD PPS with the stock FFC (default off)");
+		 "without the pack gauge: finish the charge after PD PPS with the stock FFC");
+
+/*
+ * The stock full decision and percentage on a board without the pack
+ * gauge. The firmware decides neither: it holds the cell at its float
+ * voltage and its own percentage stops short of 100 (93 % at 4484 mV and
+ * 43 mA measured). Set, the AP declares the pack full on every charge as
+ * the stock charger does (above 4440 mV at no more than 597 mA, recharge
+ * from 4390 mV, see qcom_battmgr_buck_guard()) and the battery reports the
+ * stock percentage (erhai_uisoc.h) instead of the firmware's, which stays
+ * in charge_contract. Only for the stock pack's battery profile, the same
+ * decision as gaugeless_ffc. Clearing it gives both back to the firmware.
+ */
+static bool gaugeless_full = true;
+module_param(gaugeless_full, bool, 0644);
+MODULE_PARM_DESC(gaugeless_full,
+		 "without the pack gauge: the stock full decision and percentage");
 
 static struct power_supply *qcom_battmgr_gauge(struct qcom_battmgr *b)
 {
@@ -888,6 +920,8 @@ static bool qcom_battmgr_gaugeless(struct qcom_battmgr *b)
 {
 	return READ_ONCE(b->gauge_state) == GAUGE_ABSENT;
 }
+
+static bool qcom_battmgr_uisoc_shown(struct qcom_battmgr *b);
 
 static const char *qcom_battmgr_gauge_name(struct qcom_battmgr *b)
 {
@@ -1117,6 +1151,7 @@ static unsigned int qcom_battmgr_gauge_detect(struct qcom_battmgr *b)
 	qcom_battmgr_buck_invalidate(b);
 	dev_info(b->dev, "pack gauge not fitted: battery readings from the charger firmware, AP fast charging %s\n",
 		 READ_ONCE(gaugeless_pps_ma) ? "by gaugeless_pps_ma" : "off");
+	queue_delayed_work(system_freezable_wq, &b->uisoc_work, 0);
 	power_supply_changed(b->bat_psy);
 	return 0;
 }
@@ -1354,6 +1389,20 @@ static int qcom_battmgr_bat_get_property(struct power_supply *psy,
 	switch (psp) {
 	case POWER_SUPPLY_PROP_STATUS:
 		val->intval = battmgr->status.status;
+		/*
+		 * oplus_comm_check_battery_status(): full is reported once the
+		 * percentage has reached 100; until then, with the AP's full
+		 * decided, the pack is shown charging towards it.
+		 */
+		if (qcom_battmgr_uisoc_shown(battmgr) && READ_ONCE(battmgr->buck_online) &&
+		    (READ_ONCE(battmgr->uisoc.full) ||
+		     READ_ONCE(battmgr->buck.phase) == ERHAI_BUCK_FULL)) {
+			int region = READ_ONCE(battmgr->buck.temp_region);
+
+			val->intval = READ_ONCE(battmgr->uisoc.ui) == 100 || region == 0 || region >= 7 ?
+				      POWER_SUPPLY_STATUS_FULL : POWER_SUPPLY_STATUS_CHARGING;
+			break;
+		}
 		if (battmgr->quirks & QCOM_BATTMGR_QUIRK_OPLUS_PD) {
 			/* AP full is an attachment-scoped decision. Cell relaxation
 			 * can supply the system after output is disabled; it does
@@ -1461,6 +1510,10 @@ static int qcom_battmgr_bat_get_property(struct power_supply *psy,
 		val->intval = battmgr->status.capacity;
 		break;
 	case POWER_SUPPLY_PROP_CAPACITY:
+		if (qcom_battmgr_uisoc_shown(battmgr)) {
+			val->intval = READ_ONCE(battmgr->uisoc.ui);
+			break;
+		}
 		if (battmgr->status.percent == (unsigned int)-1)
 			return -ENODATA;
 		val->intval = battmgr->status.percent;
@@ -2104,6 +2157,12 @@ static ssize_t charge_contract_show(struct device *dev, struct device_attribute 
 			b->ffc.fault ? "fault" : "off",
 			b->ffc.fw_mv, b->ffc.pump_mv, b->ffc.fw_fv, b->ffc.restore_fv_mv,
 			b->ffc.ending ?: b->ffc.end ?: "none");
+	if (qcom_battmgr_gaugeless(b))
+		len += sysfs_emit_at(buf, len,
+			"gaugeless_full=%d stock_pack=%d fw_soc=%d ui_soc=%d smooth_soc=%d ui_full=%d ui_shown=%d ",
+			READ_ONCE(gaugeless_full), READ_ONCE(b->pack), READ_ONCE(b->uisoc_fw_soc),
+			READ_ONCE(b->uisoc.ui), READ_ONCE(b->uisoc.smooth),
+			READ_ONCE(b->uisoc.full), qcom_battmgr_uisoc_shown(b));
 	if (b->pps_ops)
 		return b->pps_ops->describe(b->pps_data, buf, len);
 	return len + sysfs_emit_at(buf, len, "state=idle\n");
@@ -2502,7 +2561,7 @@ static int qcom_battmgr_buck_pause(struct qcom_battmgr *b)
 	int ret, fv_ret = 0;
 
 	ret = qcom_battmgr_buck_write(b, BATT_OPLUS_CHG_EN, 0, &b->buck_enable_applied);
-	if (b->buck.normal_fv_mv && b->buck.temp_region < 7)
+	if (b->buck.normal_fv_mv && b->buck.temp_region < 7 && !b->buck.fv_firmware)
 		fv_ret = qcom_battmgr_buck_write(b, BATT_VOLT_MAX, b->buck.normal_fv_mv,
 					       &b->buck_fv_applied);
 	return ret ?: fv_ret;
@@ -2592,11 +2651,26 @@ static int qcom_battmgr_buck_apply(struct qcom_battmgr *b)
  * no charging below 0 C, from 53 C, from the battery overvoltage threshold,
  * nor from 45 C above the warm float voltage until the warm recharge one.
  */
-static bool qcom_battmgr_guard_withholds(const struct erhai_buck *buck, int mv)
+static bool qcom_battmgr_guard_withholds(const struct erhai_buck *buck, int mv, bool withheld)
 {
 	if (buck->temp_region < 2 || buck->temp_region > 7 || buck->over_voltage)
 		return true;
-	return buck->temp_region == 7 && mv > (buck->disable ? 4030 : 4130);
+	return buck->temp_region == 7 && mv > (withheld ? 4030 : 4130);
+}
+
+/*
+ * Whether the firmware selected the stock pack's battery profile, checked
+ * until it has said so; see qcom_battmgr_gaugeless_pack().
+ */
+static bool qcom_battmgr_gaugeless_pack(struct qcom_battmgr *b);
+
+static int qcom_battmgr_stock_pack(struct qcom_battmgr *b)
+{
+	if (READ_ONCE(b->pack) == 1 || time_before(jiffies, READ_ONCE(b->pack_at)))
+		return READ_ONCE(b->pack);
+	WRITE_ONCE(b->pack, qcom_battmgr_gaugeless_pack(b));
+	WRITE_ONCE(b->pack_at, jiffies + msecs_to_jiffies(CHARGE_CTRL_POLL_MS));
+	return READ_ONCE(b->pack);
 }
 
 /* The master pump's battery ADC, pumps idle; @hold false turns it off. */
@@ -2640,7 +2714,7 @@ static int qcom_battmgr_ffc_handback(struct qcom_battmgr *b, const char *why)
 				      qcom_battmgr_buck_write(b, BATT_OPLUS_SET_FULL, 0,
 							      &b->buck_full_applied);
 	}
-	enable = !qcom_battmgr_guard_withholds(buck, b->buck_sample.mv) &&
+	enable = !qcom_battmgr_guard_withholds(buck, b->buck_sample.mv, buck->disable) &&
 		 !b->charge_policy_hold && !b->charge_inhibited;
 	ret = ret ?: qcom_battmgr_buck_write(b, BATT_OPLUS_CHG_EN, enable,
 					     &b->buck_enable_applied);
@@ -2658,6 +2732,7 @@ static int qcom_battmgr_ffc_handback(struct qcom_battmgr *b, const char *why)
 	b->tail_owned = false;
 	/* The guard starts over on the next pass. */
 	b->buck = (struct erhai_buck){};
+	b->guard_withheld = !enable;
 	power_supply_changed(b->bat_psy);
 	return 0;
 }
@@ -2671,13 +2746,19 @@ static int qcom_battmgr_buck_release(struct qcom_battmgr *b)
 		return qcom_battmgr_ffc_handback(b, b->ffc.ending ?: "charger removed or driver stopped");
 	if (b->buck.phase == ERHAI_BUCK_OFF)
 		return 0;
-	if (!b->buck.normal_fv_mv) {
+	if (!b->buck.normal_fv_mv || b->buck.fv_firmware) {
 		ret = qcom_battmgr_buck_write(b, BATT_OPLUS_CHG_EN,
 					    !b->charge_policy_hold && !b->charge_inhibited,
 					    &b->buck_enable_applied);
-		if (!ret)
-			b->buck = (struct erhai_buck){};
-		return ret;
+		if (ret)
+			return ret;
+		/* Not full any more for the firmware's gauge either. */
+		if (b->buck.fv_firmware && b->buck_full_applied != 0)
+			b->buck_gauge_error = qcom_battmgr_buck_write(b, BATT_OPLUS_SET_FULL, 0,
+								      &b->buck_full_applied);
+		b->buck = (struct erhai_buck){};
+		b->guard_withheld = false;
+		return 0;
 	}
 	enable = b->buck.phase != ERHAI_BUCK_FULL && !b->buck.over_voltage &&
 		 b->buck.temp_region > 0 && b->buck.temp_region < 8 &&
@@ -2740,9 +2821,11 @@ static int qcom_battmgr_buck_read(struct qcom_battmgr *b, struct erhai_buck_samp
 static unsigned int qcom_battmgr_buck_guard(struct qcom_battmgr *b)
 {
 	struct erhai_buck *buck = &b->buck;
-	bool disable;
-	u32 uv, temp;
-	int mv, ret;
+	enum erhai_buck_phase previous;
+	struct erhai_buck_sample s;
+	bool withhold, disable, full_check, pumps;
+	u32 uv, ua, temp, soc, cycles;
+	int mv, ret, region;
 
 	if (buck->phase == ERHAI_BUCK_OFF)
 		erhai_buck_start(buck, jiffies);
@@ -2758,21 +2841,64 @@ static unsigned int qcom_battmgr_buck_guard(struct qcom_battmgr *b)
 	mv = uv / 1000;
 	b->buck_sample = (struct erhai_buck_sample){ .mv = mv, .temp = (s32)temp / 10 };
 	b->buck_sample_at = jiffies;
-	buck->next_sample = jiffies + msecs_to_jiffies(4000);
+	previous = buck->phase;
+	pumps = qcom_battmgr_pps_running(b);
+	WRITE_ONCE(b->uisoc_fastchg, pumps);
 
-	erhai_buck_temperature(buck, b->buck_sample.temp);
-	if (mv >= 4600)
-		buck->over_voltage = true;
-	else if (mv < 4400)
-		buck->over_voltage = false;
-	disable = qcom_battmgr_guard_withholds(buck, mv);
+	/*
+	 * gaugeless_full: the stock full and recharge checks (erhai_buck.h,
+	 * oplus_comm_check_sw_full() and _check_rechg()) on the firmware's
+	 * readings. Not while the pumps charge (the stock charger checks no
+	 * full during a fast session) nor while a policy holds the output.
+	 * The firmware keeps its float voltage, so only the current decides.
+	 */
+	full_check = READ_ONCE(gaugeless_full) && !pumps && !b->charge_policy_hold &&
+		     !b->charge_inhibited && qcom_battmgr_stock_pack(b) == 1;
+	if (full_check) {
+		ret = qcom_battmgr_get_property(b, BATTMGR_BAT_PROPERTY_GET, BATT_CURR_NOW, &ua);
+		ret = ret ?: qcom_battmgr_get_property(b, BATTMGR_BAT_PROPERTY_GET, BATT_CAPACITY,
+						    &soc);
+		ret = ret ?: qcom_battmgr_get_property(b, BATTMGR_BAT_PROPERTY_GET,
+						    BATT_CYCLE_COUNT, &cycles);
+		if (!ret && (soc > 10000 || ua == BIT(31)))
+			ret = -ENODATA;
+		if (ret)
+			goto fail;
+		s = (struct erhai_buck_sample){
+			.mv = mv, .ma = -(s32)ua / 1000, .temp = (s32)temp / 10,
+			.soc = soc / 100, .cycles = cycles, .qualified = true,
+		};
+		b->buck_sample = s;
+		buck->fv_firmware = true;
+		erhai_buck_update(buck, &s, jiffies);
+		buck->recharged = false;	/* PPS may follow by itself */
+	} else {
+		if (!READ_ONCE(gaugeless_full) && buck->phase == ERHAI_BUCK_FULL)
+			buck->phase = ERHAI_BUCK_NORMAL;
+		buck->next_sample = jiffies + msecs_to_jiffies(4000);
+		erhai_buck_temperature(buck, b->buck_sample.temp);
+		if (mv >= 4600)
+			buck->over_voltage = true;
+		else if (mv < 4400)
+			buck->over_voltage = false;
+	}
 
-	if (disable != buck->disable || b->buck_error)
+	withhold = qcom_battmgr_guard_withholds(buck, mv, b->guard_withheld);
+	if (withhold != b->guard_withheld || b->buck_error)
 		dev_info(b->dev, "charge output %s: cell %d mV, %s%d.%d C\n",
-			 disable ? "withdrawn" : "allowed", mv,
+			 withhold ? "withdrawn" : "allowed", mv,
 			 b->buck_sample.temp < 0 ? "-" : "",
 			 abs(b->buck_sample.temp) / 10, abs(b->buck_sample.temp) % 10);
-	if (disable != buck->disable)
+	b->guard_withheld = withhold;
+	if (previous != buck->phase && (previous == ERHAI_BUCK_FULL ||
+					buck->phase == ERHAI_BUCK_FULL)) {
+		dev_info(b->dev, "%s: cell %d mV, %d mA, firmware %d%%\n",
+			 buck->phase == ERHAI_BUCK_FULL ? "battery full" : "recharge",
+			 mv, b->buck_sample.ma, b->buck_sample.soc);
+		mod_delayed_work(system_freezable_wq, &b->uisoc_work, 0);
+	}
+	disable = withhold || buck->phase == ERHAI_BUCK_FULL;
+	if (disable != buck->disable || previous != buck->phase)
 		power_supply_changed(b->bat_psy);
 	buck->disable = disable;
 	ret = qcom_battmgr_buck_write(b, BATT_OPLUS_CHG_EN,
@@ -2780,6 +2906,23 @@ static unsigned int qcom_battmgr_buck_guard(struct qcom_battmgr *b)
 				      &b->buck_enable_applied);
 	if (ret)
 		goto fail;
+	/*
+	 * The stock gauge hints (oplus_get_props_from_adsp_by_buffer(),
+	 * oplus_mms_gauge_set_batt_full_work()): fast charging, no FFC, the
+	 * temperature region; full up to the normal-high region. Hints: a
+	 * refusal is recorded, not acted on.
+	 */
+	if (READ_ONCE(b->pack) == 1 && buck->temp_region >= 0 &&
+	    (READ_ONCE(gaugeless_full) || b->buck_full_applied == 1)) {
+		region = buck->temp_region >= 2 ? buck->temp_region + 1 : buck->temp_region;
+		b->buck_gauge_error =
+			qcom_battmgr_buck_write(b, BATT_OPLUS_FULL_PARA, (region << 3) | pumps,
+						&b->buck_para_applied) ?:
+			qcom_battmgr_buck_write(b, BATT_OPLUS_SET_FULL,
+						buck->phase == ERHAI_BUCK_FULL &&
+						buck->temp_region <= 6,
+						&b->buck_full_applied);
+	}
 	b->buck_error = 0;
 	return 4000;
 
@@ -2787,6 +2930,7 @@ fail:
 	if (b->buck_error != ret)
 		dev_warn(b->dev, "charge guard failed: %d; withdrawing charge output\n", ret);
 	b->buck_error = ret;
+	buck->sw_count = buck->hw_count = buck->recharge_count = 0;
 	qcom_battmgr_buck_pause(b);
 	return PD_POLL_MS;
 }
@@ -2827,7 +2971,7 @@ static void qcom_battmgr_ffc_arm(struct qcom_battmgr *b)
 	else if (b->buck.phase == ERHAI_BUCK_OFF || b->buck.disable || b->buck_error)
 		no = "the charge guard withholds charging";
 	/* As for PPS: the stock pack by the firmware's battery profile. */
-	else if (!qcom_battmgr_gaugeless_pack(b))
+	else if (qcom_battmgr_stock_pack(b) != 1)
 		no = "the firmware reports no " ERHAI_FW_PACK_PROFILE " battery profile";
 	else if ((pump = qcom_battmgr_pump_cell_mv(b, true)) < 0 && pump != -ENODATA)
 		no = "the pump battery ADC cannot be read";
@@ -2853,6 +2997,9 @@ static void qcom_battmgr_ffc_arm(struct qcom_battmgr *b)
 	b->ffc.next = jiffies;
 	b->tail_owned = true;
 	b->buck_error = 0;
+	/* The AP owns the float voltage now; the pumps are done. */
+	b->buck.fv_firmware = false;
+	WRITE_ONCE(b->uisoc_fastchg, false);
 	/* switch_ffc: 15 s with the output off, then ffc_start_work. */
 	erhai_buck_pump_done(&b->buck, jiffies);
 	dev_info(b->dev, "gaugeless FFC: PPS session complete, output off for 15 s, then FFC; firmware FV %d, handed back as %d mV\n",
@@ -3805,6 +3952,94 @@ static void qcom_battmgr_gaugeless_pumps(struct qcom_battmgr *b)
 	set_bit(PD_EVENT_CAPS, &b->pd_events);
 }
 
+/* The stock percentage is what the battery reports (gaugeless_full). */
+static bool qcom_battmgr_uisoc_shown(struct qcom_battmgr *b)
+{
+	return qcom_battmgr_gaugeless(b) && READ_ONCE(gaugeless_full) &&
+	       READ_ONCE(b->uisoc.ready);
+}
+
+/* BATT_RTC_SOC: where the stock charger keeps the percentage over a reboot. */
+#define BATT_OPLUS_RTC_SOC		31
+
+/*
+ * The stock percentage on a board without the pack gauge (erhai_uisoc.h),
+ * on its own freezable work: it runs with and without a charger, every
+ * 10 s or when a step is due, and catches up after a suspend.
+ */
+static void qcom_battmgr_uisoc_worker(struct work_struct *work)
+{
+	struct qcom_battmgr *b = container_of(to_delayed_work(work), struct qcom_battmgr,
+					      uisoc_work);
+	struct erhai_uisoc_in in;
+	unsigned long delay = 5 * HZ;
+	u32 soc, uv, ua, temp, online, saved = 0;
+	bool changed = false, init = false;
+	int ui, ret;
+
+	if (READ_ONCE(b->removing) || !qcom_battmgr_gaugeless(b))
+		return;
+	if (!READ_ONCE(gaugeless_full) || qcom_battmgr_stock_pack(b) != 1) {
+		if (READ_ONCE(b->uisoc.ready)) {
+			WRITE_ONCE(b->uisoc.ready, false);
+			dev_info(b->dev, "percentage: the firmware's again\n");
+			power_supply_changed(b->bat_psy);
+		}
+		delay = msecs_to_jiffies(CHARGE_CTRL_POLL_MS);
+		goto out;
+	}
+	ret = qcom_battmgr_get_property(b, BATTMGR_BAT_PROPERTY_GET, BATT_CAPACITY, &soc);
+	ret = ret ?: qcom_battmgr_get_property(b, BATTMGR_BAT_PROPERTY_GET, BATT_VOLT_NOW, &uv);
+	ret = ret ?: qcom_battmgr_get_property(b, BATTMGR_BAT_PROPERTY_GET, BATT_CURR_NOW, &ua);
+	ret = ret ?: qcom_battmgr_get_property(b, BATTMGR_BAT_PROPERTY_GET, BATT_TEMP, &temp);
+	ret = ret ?: qcom_battmgr_get_property(b, BATTMGR_USB_PROPERTY_GET, USB_ONLINE, &online);
+	if (ret || !uv || soc > 10000 || ua == BIT(31))
+		goto out;	/* keep showing the last percentage */
+	in = (struct erhai_uisoc_in){
+		.soc = soc / 100, .vbat_mv = uv / 1000,
+		/* The firmware reports discharge positive, as the stock ibat. */
+		.ibat_ma = (s32)ua / 1000,
+		.online = online && !READ_ONCE(b->otg_request),
+		.mmi = !READ_ONCE(b->charge_policy_hold) && !READ_ONCE(b->charge_inhibited),
+		.ap_full = READ_ONCE(b->buck.phase) == ERHAI_BUCK_FULL && READ_ONCE(b->buck_online),
+		.fastchg = READ_ONCE(b->uisoc_fastchg),
+		.warm = erhai_buck_region((s32)temp / 10) >= 7,
+	};
+
+	mutex_lock(&b->uisoc_lock);
+	if (!b->uisoc.ready) {
+		ret = qcom_battmgr_get_property(b, BATTMGR_BAT_PROPERTY_GET, BATT_OPLUS_RTC_SOC,
+						&saved);
+		erhai_uisoc_init(&b->uisoc, &in, ret ? -1 : (int)saved, jiffies);
+		init = changed = true;
+	} else {
+		b->uisoc.sleep_s += atomic_long_xchg(&b->uisoc_sleep_s, 0);
+		ui = b->uisoc.ui;
+		delay = erhai_uisoc_update(&b->uisoc, &in, jiffies, &changed);
+		changed |= ui != b->uisoc.ui;
+	}
+	ui = b->uisoc.ui;
+	WRITE_ONCE(b->uisoc_fw_soc, in.soc);
+	mutex_unlock(&b->uisoc_lock);
+
+	if (init)
+		dev_info(b->dev, "percentage: the stock one, %d%% (firmware %d%%, saved %d%%)\n",
+			 ui, in.soc, ret ? -1 : (int)saved);
+	if (!changed)
+		goto out;
+	dev_dbg(b->dev, "percentage %d%% full %d (firmware %d%%, smoothed %d%%)\n", ui,
+		b->uisoc.full, in.soc, b->uisoc.smooth);
+	/* oplus_back_ui_soc_work(): saved on every change. */
+	ret = qcom_battmgr_set_property(b, BATTMGR_BAT_PROPERTY_SET, BATT_OPLUS_RTC_SOC, ui);
+	if (ret && !b->uisoc_backup_failed)
+		dev_warn(b->dev, "percentage: saving it for a reboot failed: %d\n", ret);
+	b->uisoc_backup_failed = !!ret;
+	power_supply_changed(b->bat_psy);
+out:
+	if (!READ_ONCE(b->removing))
+		queue_delayed_work(system_freezable_wq, &b->uisoc_work, delay);
+}
+
 static void qcom_battmgr_charge_worker(struct work_struct *work)
 {
 	struct qcom_battmgr *battmgr = container_of(to_delayed_work(work),
@@ -3951,6 +4186,7 @@ static int qcom_battmgr_pm_notify(struct notifier_block *nb,
 	switch (action) {
 	case PM_HIBERNATION_PREPARE:
 	case PM_SUSPEND_PREPARE:
+		battmgr->uisoc_suspend_at = ktime_get_boottime();
 		if (!qcom_battmgr_prepare_sleep(battmgr))
 			return NOTIFY_BAD;
 		mutex_lock(&battmgr->charge_lock);
@@ -3972,6 +4208,14 @@ static int qcom_battmgr_pm_notify(struct notifier_block *nb,
 	case PM_POST_HIBERNATION:
 	case PM_POST_RESTORE:
 	case PM_POST_SUSPEND:
+		/* oplus_comm_pm_resume(): the time asleep, for the percentage. */
+		if (battmgr->uisoc_suspend_at) {
+			atomic_long_add(ktime_ms_delta(ktime_get_boottime(),
+						       battmgr->uisoc_suspend_at) / 1000,
+					&battmgr->uisoc_sleep_s);
+			battmgr->uisoc_suspend_at = 0;
+			mod_delayed_work(system_freezable_wq, &battmgr->uisoc_work, 0);
+		}
 		if (!READ_ONCE(battmgr->pps_suspended))
 			break;
 		scoped_guard(mutex, &battmgr->charge_lock) {
@@ -5288,6 +5532,7 @@ static void qcom_battmgr_cancel_work(void *data)
 	struct qcom_battmgr *battmgr = data;
 
 	disable_delayed_work_sync(&battmgr->charge_work);
+	disable_delayed_work_sync(&battmgr->uisoc_work);
 	disable_work_sync(&battmgr->otg_work);
 	mutex_lock(&battmgr->charge_lock);
 	qcom_battmgr_pps_stop(battmgr, false, "driver-stop");
@@ -5599,6 +5844,9 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
 	psy_cfg_supply.no_wakeup_source = true;
 
 	INIT_DELAYED_WORK(&battmgr->charge_work, qcom_battmgr_charge_worker);
+	INIT_DELAYED_WORK(&battmgr->uisoc_work, qcom_battmgr_uisoc_worker);
+	mutex_init(&battmgr->uisoc_lock);
+	battmgr->pack = -1;
 	INIT_WORK(&battmgr->enable_work, qcom_battmgr_enable_worker);
 	INIT_WORK(&battmgr->otg_work, qcom_battmgr_otg_worker);
 	mutex_init(&battmgr->lock);
