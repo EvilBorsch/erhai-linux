@@ -692,6 +692,10 @@ static int __qcom_battmgr_request(struct qcom_battmgr *battmgr, void *data,
 	if (!ret) {
 		left = wait_for_completion_timeout(&battmgr->ack, timeout);
 		ret = left ? battmgr->error : -ETIMEDOUT;
+		/* Tells a silent firmware from one that answers with an error. */
+		if (!left)
+			dev_warn_ratelimited(battmgr->dev, "no answer to request %#x in %u ms\n",
+					     le32_to_cpu(hdr->opcode), jiffies_to_msecs(timeout));
 	}
 	WRITE_ONCE(battmgr->request_opcode, U32_MAX);
 
@@ -3251,7 +3255,8 @@ static unsigned int qcom_battmgr_pd_update(struct qcom_battmgr *battmgr)
 	bool stable, ufcs_active, tail, probe_idle, prefer_pps, dedicated, can_probe, can_probe_pumps;
 	bool serial_source, detached, qc, try_qc, caps_changed, current_changed = false, bypass;
 	bool gaugeless = qcom_battmgr_gaugeless(battmgr);
-	u32 online, type = POWER_SUPPLY_USB_TYPE_UNKNOWN, health, vbat, vbus, ua, real_type;
+	u32 online, type = POWER_SUPPLY_USB_TYPE_UNKNOWN, health, vbat, vbus = 0, ua, real_type;
+	const char *step;
 	int ret;
 
 	if (!battmgr->pps_ops && qcom_battmgr_serial_buck(battmgr, false))
@@ -3782,6 +3787,7 @@ fixed_contract:
 			ret = qcom_battmgr_set_property(battmgr, BATTMGR_BAT_PROPERTY_SET,
 							qc ? BATT_OPLUS_SET_QC : BATT_OPLUS_SET_PDO,
 							PD_FIXED_MV);
+		step = "request";
 		if (ret)
 			goto failed;
 		battmgr->pd_state = PD_WAIT;
@@ -3794,6 +3800,7 @@ fixed_contract:
 	case PD_ACTIVE:
 		ret = qcom_battmgr_get_property(battmgr, BATTMGR_USB_PROPERTY_GET,
 						USB_VOLT_NOW, &vbus);
+		step = "VBUS read";
 		if (ret)
 			goto failed;
 		if (vbus < (qc ? 8000000 : PD_VBUS_RISEN_UV)) {
@@ -3801,10 +3808,12 @@ fixed_contract:
 			    time_before(jiffies, battmgr->pd_since +
 					msecs_to_jiffies(qc ? 350 : PD_CONFIG_TIMEOUT_MS)))
 				return qc ? 350 : PD_POLL_MS;
+			step = "VBUS too low";
 			ret = -ETIMEDOUT;
 			goto failed;
 		}
 		if (vbus >= PD_VBUS_MAX_UV) {
+			step = "VBUS too high";
 			ret = -ERANGE;
 			goto failed;
 		}
@@ -3812,10 +3821,12 @@ fixed_contract:
 			ret = qcom_battmgr_set_property(battmgr, BATTMGR_USB_PROPERTY_SET,
 							USB_INPUT_CURR_LIMIT,
 							battmgr->pd_input_limit_ua);
+			step = "input limit";
 			if (ret)
 				goto failed;
 		}
 		ret = qcom_battmgr_pd_fcc(battmgr);
+		step = "charge current";
 		if (ret)
 			goto failed;
 		if (!battmgr->stable_seen) {
@@ -3834,7 +3845,11 @@ fixed_contract:
 	}
 
 failed:
-	dev_warn(battmgr->dev, "PD: 9 V request failed: %d\n", ret);
+	if (battmgr->pd_state == PD_IDLE)
+		dev_warn(battmgr->dev, "PD: 9 V request failed (%s): %d\n", step, ret);
+	else
+		dev_warn(battmgr->dev, "PD: 9 V request failed (%s): %d, VBUS %u mV, %u ms after the request\n",
+			 step, ret, vbus / 1000, jiffies_to_msecs(jiffies - battmgr->pd_since));
 	qcom_battmgr_pd_stop(battmgr, false, "request failed");
 	battmgr->pd_since = jiffies;
 	if (!qc && dedicated) {
