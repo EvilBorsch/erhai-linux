@@ -151,11 +151,19 @@ static void sync_for_device(struct msm_gem_object *msm_obj)
 	dma_map_sgtable(dev, msm_obj->sgt, DMA_BIDIRECTIONAL, 0);
 }
 
-static void sync_for_cpu(struct msm_gem_object *msm_obj)
+static void sync_for_cpu(struct msm_gem_object *msm_obj, bool discard)
 {
 	struct device *dev = msm_obj->base.dev->dev;
 
-	dma_unmap_sgtable(dev, msm_obj->sgt, DMA_BIDIRECTIONAL, 0);
+	/*
+	 * Pages whose contents are thrown away need no invalidation: nothing
+	 * reads them back through the CPU cache, and the dma_map_sgtable() of
+	 * their next owner cleans whatever it wrote. Invalidating a buffer by
+	 * VA takes time in proportion to its size: freeing a few full-screen
+	 * render targets at once stalled the GL driver thread for 40-80 ms.
+	 */
+	dma_unmap_sgtable(dev, msm_obj->sgt, DMA_BIDIRECTIONAL,
+			  discard ? DMA_ATTR_SKIP_CPU_SYNC : 0);
 }
 
 static void update_lru_active(struct drm_gem_object *obj)
@@ -248,7 +256,11 @@ static struct page **get_pages(struct drm_gem_object *obj)
 	return msm_obj->pages;
 }
 
-static void put_pages(struct drm_gem_object *obj)
+/*
+ * Releases the backing pages. With @discard their contents go away (the object
+ * is freed or purged); without it they may be swapped out and read back.
+ */
+static void put_pages(struct drm_gem_object *obj, bool discard)
 {
 	struct msm_gem_object *msm_obj = to_msm_bo(obj);
 
@@ -266,7 +278,7 @@ static void put_pages(struct drm_gem_object *obj)
 			 * GPU, etc. are not coherent:
 			 */
 			if (msm_obj->flags & MSM_BO_WC)
-				sync_for_cpu(msm_obj);
+				sync_for_cpu(msm_obj, discard);
 
 			sg_free_table(msm_obj->sgt);
 			kfree(msm_obj->sgt);
@@ -886,7 +898,7 @@ void msm_gem_purge(struct drm_gem_object *obj)
 
 	drm_vma_node_unmap(&obj->vma_node, dev->anon_inode->i_mapping);
 
-	put_pages(obj);
+	put_pages(obj, true);
 
 	mutex_lock(&dev->gem_lru_mutex);
 	/* A one-way transition: */
@@ -922,7 +934,7 @@ void msm_gem_evict(struct drm_gem_object *obj)
 
 	drm_vma_node_unmap(&obj->vma_node, dev->anon_inode->i_mapping);
 
-	put_pages(obj);
+	put_pages(obj, false);
 }
 
 void msm_gem_vunmap(struct drm_gem_object *obj)
@@ -1143,7 +1155,7 @@ static void msm_gem_free_object(struct drm_gem_object *obj)
 			drm_prime_gem_destroy(obj, msm_obj->sgt);
 	} else {
 		msm_gem_vunmap(obj);
-		put_pages(obj);
+		put_pages(obj, true);
 	}
 
 	/*
